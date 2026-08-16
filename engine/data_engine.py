@@ -4,6 +4,7 @@
 # ============================================================
 
 from pathlib import Path
+import time
 import warnings
 
 import numpy as np
@@ -144,6 +145,163 @@ def _download_history(ticker):
 
     yahoo_ticker = f"{ticker}.SA"
 
+    # ========================================================
+    # POLÍTICA DE RETRY
+    # ========================================================
+    #
+    # Objetivo:
+    # - evitar que um rate limit temporário elimine um FII;
+    # - não inventar dados;
+    # - tentar duas rotas do Yahoo;
+    # - manter o pipeline enxuto.
+    #
+    # Estratégia:
+    # 1. yf.download com configuração principal;
+    # 2. repetir com espera progressiva;
+    # 3. fallback via Ticker.history;
+    # 4. última tentativa sem repair.
+    #
+    max_attempts = 3
+
+    for attempt in range(1, max_attempts + 1):
+
+        try:
+
+            df = yf.download(
+                yahoo_ticker,
+                period=PRICE_HISTORY,
+                interval="1d",
+                auto_adjust=YAHOO_AUTO_ADJUST,
+                repair=YAHOO_REPAIR,
+                progress=False,
+                threads=False,
+            )
+
+            if df is not None and not df.empty:
+
+                df = _normalize_columns(
+                    df.copy()
+                )
+
+                df.index = pd.to_datetime(
+                    df.index,
+                    errors="coerce"
+                )
+
+                df = df[
+                    ~df.index.isna()
+                ]
+
+                df = df[
+                    ~df.index.duplicated(
+                        keep="last"
+                    )
+                ]
+
+                df = df.sort_index()
+
+                if not df.empty:
+
+                    if attempt > 1:
+
+                        print(
+                            f"[RECUPERADO] {ticker} "
+                            f"na tentativa {attempt}."
+                        )
+
+                    return df
+
+        except Exception as exc:
+
+            print(
+                f"[AVISO] {ticker} | "
+                f"tentativa {attempt}/{max_attempts} "
+                f"falhou: {exc}"
+            )
+
+
+        # ----------------------------------------------------
+        # FALLBACK VIA Ticker.history
+        # ----------------------------------------------------
+
+        try:
+
+            tk = yf.Ticker(
+                yahoo_ticker
+            )
+
+            df_alt = tk.history(
+                period=PRICE_HISTORY,
+                interval="1d",
+                auto_adjust=YAHOO_AUTO_ADJUST,
+                repair=YAHOO_REPAIR,
+                actions=False,
+            )
+
+            if df_alt is not None and not df_alt.empty:
+
+                df_alt = _normalize_columns(
+                    df_alt.copy()
+                )
+
+                df_alt.index = pd.to_datetime(
+                    df_alt.index,
+                    errors="coerce"
+                )
+
+                df_alt = df_alt[
+                    ~df_alt.index.isna()
+                ]
+
+                df_alt = df_alt[
+                    ~df_alt.index.duplicated(
+                        keep="last"
+                    )
+                ]
+
+                df_alt = df_alt.sort_index()
+
+                if not df_alt.empty:
+
+                    print(
+                        f"[RECUPERADO] {ticker} "
+                        f"via Ticker.history."
+                    )
+
+                    return df_alt
+
+        except Exception as exc:
+
+            print(
+                f"[AVISO] {ticker} | "
+                f"fallback history falhou: {exc}"
+            )
+
+
+        # ----------------------------------------------------
+        # ESPERA PROGRESSIVA
+        # ----------------------------------------------------
+
+        if attempt < max_attempts:
+
+            wait_seconds = (
+                2 ** (attempt - 1)
+            )
+
+            print(
+                f"[RETRY] {ticker} em "
+                f"{wait_seconds}s..."
+            )
+
+            time.sleep(
+                wait_seconds
+            )
+
+
+    # ========================================================
+    # ÚLTIMA TENTATIVA — SEM REPAIR
+    # ========================================================
+
     try:
 
         df = yf.download(
@@ -151,42 +309,63 @@ def _download_history(ticker):
             period=PRICE_HISTORY,
             interval="1d",
             auto_adjust=YAHOO_AUTO_ADJUST,
-            repair=YAHOO_REPAIR,
+            repair=False,
             progress=False,
             threads=False,
         )
 
+        if df is not None and not df.empty:
+
+            df = _normalize_columns(
+                df.copy()
+            )
+
+            df.index = pd.to_datetime(
+                df.index,
+                errors="coerce"
+            )
+
+            df = df[
+                ~df.index.isna()
+            ]
+
+            df = df[
+                ~df.index.duplicated(
+                    keep="last"
+                )
+            ]
+
+            df = df.sort_index()
+
+            if not df.empty:
+
+                print(
+                    f"[RECUPERADO] {ticker} "
+                    f"na última tentativa sem repair."
+                )
+
+                return df
+
     except Exception as exc:
 
         print(
-            f"[AVISO] Falha ao coletar {ticker}: {exc}"
+            f"[AVISO] {ticker} | "
+            f"última tentativa falhou: {exc}"
         )
 
-        return pd.DataFrame()
 
-    if df is None or df.empty:
-        return pd.DataFrame()
+    # ========================================================
+    # FALHA DEFINITIVA
+    # ========================================================
 
-    df = _normalize_columns(df.copy())
-
-    df.index = pd.to_datetime(
-        df.index,
-        errors="coerce"
+    print(
+        f"[FALHA DE DADOS] {ticker} não foi "
+        f"coletado após todas as tentativas. "
+        f"O ativo não será considerado aprovado "
+        f"pela Regra Zero nesta execução."
     )
 
-    df = df[
-        ~df.index.isna()
-    ]
-
-    df = df[
-        ~df.index.duplicated(
-            keep="last"
-        )
-    ]
-
-    df = df.sort_index()
-
-    return df
+    return pd.DataFrame()
 
 
 # ============================================================
@@ -214,6 +393,8 @@ def _calculate_market_metrics(ticker, history):
         "eventos_extremos": 0,
 
         "dados_preco_ok": False,
+
+        "status_coleta": "SEM_DADOS",
     }
 
     if history.empty:
@@ -248,6 +429,8 @@ def _calculate_market_metrics(ticker, history):
     result["dados_preco_ok"] = (
         len(close) >= MIN_PRICE_OBSERVATIONS
     )
+
+    result["status_coleta"] = "OK"
 
 
     # --------------------------------------------------------
@@ -465,6 +648,40 @@ def _print_audit(df):
         "Com evento diário extremo  :",
         len(extreme)
     )
+
+
+    failed_collection = df[
+        df[
+            "status_coleta"
+        ] != "OK"
+    ]
+
+    print(
+        "Falhas definitivas de coleta:",
+        len(
+            failed_collection
+        )
+    )
+
+    if not failed_collection.empty:
+
+        print()
+        print(
+            "ATENÇÃO — FALHAS DE COLETA"
+        )
+
+        print(
+            failed_collection[
+                [
+                    "ticker",
+                    "status_coleta",
+                    "regra_zero_aprovado",
+                ]
+            ]
+            .to_string(
+                index=False
+            )
+        )
 
 
     if not extreme.empty:
