@@ -6,6 +6,12 @@
 from pathlib import Path
 import time
 import warnings
+import io
+import re
+import zipfile
+import unicodedata
+from difflib import SequenceMatcher
+from urllib.request import Request, urlopen
 
 import numpy as np
 import pandas as pd
@@ -48,6 +54,65 @@ STRUCTURAL_FACTOR_TOLERANCE = 0.20
 
 HISTORY_CLEAN_DIR = Path(DATA_DIR) / "history_clean"
 VALUATION_CACHE_FILE = Path(DATA_DIR) / "valuation_cache.csv"
+
+# ============================================================
+# VALUATION OFICIAL — FALLBACK CVM
+# ============================================================
+#
+# O Yahoo continuará sendo a primeira fonte por ser leve.
+# Quando P/VP não estiver disponível, usamos o Informe Mensal
+# Estruturado oficial da CVM para obter:
+#   Patrimônio Líquido / Cotas Emitidas = VP por cota
+#   Preço atual / VP por cota = P/VP
+#
+# O ZIP é baixado UMA VEZ por execução.
+#
+CVM_FII_YEAR = 2026
+CVM_FII_MONTHLY_URL = (
+    "https://dados.cvm.gov.br/dados/FII/DOC/"
+    f"INF_MENSAL/DADOS/inf_mensal_fii_{CVM_FII_YEAR}.zip"
+)
+
+# Aliases econômicos específicos. Servem somente para identificar
+# de forma conservadora o fundo no arquivo oficial da CVM.
+FII_CVM_ALIASES = {
+    "KNCR11": "KINEA RENDIMENTOS IMOBILIARIOS",
+    "MXRF11": "MAXI RENDA",
+    "KNSC11": "KINEA SECURITIES",
+    "KNIP11": "KINEA INDICES DE PRECOS",
+    "VRTA11": "FATOR VERITA",
+    "KNHY11": "KINEA HIGH YIELD CRI",
+    "XPCI11": "XP CREDITO IMOBILIARIO",
+    "KCRE11": "KINEA CREDITAS",
+    "RZAK11": "RIZA AKIN",
+    "BCRI11": "BANESTES RECEBIVEIS IMOBILIARIOS",
+    "OUJP11": "OURINVEST JPP",
+    "DEVA11": "DEVANT RECEBIVEIS IMOBILIARIOS",
+    "HCTR11": "HECTARE CE",
+    "URPR11": "URCA PRIME RENDA",
+    "XPLG11": "XP LOG",
+    "HGLG11": "PATRIA LOG",
+    "XPML11": "XP MALLS",
+    "HGRU11": "PATRIA RENDA URBANA",
+    "HGBS11": "HEDGE BRASIL SHOPPING",
+    "ALZR11": "ALIANZA TRUST RENDA IMOBILIARIA",
+    "GTWR11": "GREEN TOWERS",
+    "HSML11": "HSI MALLS",
+    "SNEL11": "SUNO ENERGIA",
+    "LVBI11": "VBI LOGISTICO",
+    "VISC11": "VINCI SHOPPING CENTERS",
+    "BRCO11": "BRESCO LOGISTICA",
+    "VILG11": "VINCI LOGISTICA",
+    "JSRE11": "JS REAL ESTATE",
+    "HSLG11": "HSI LOGISTICA",
+    "RCRB11": "RIO BRAVO RENDA CORPORATIVA",
+    "TRXF11": "TRX REAL ESTATE",
+    "KNRI11": "KINEA RENDA IMOBILIARIA",
+    "VGHF11": "VALORA HEDGE FUND",
+    "KFOF11": "KINEA FUNDO DE FUNDOS",
+    "JSAF11": "JS ATIVOS FINANCEIROS",
+    "TGAR11": "TG ATIVO REAL",
+}
 
 
 # ============================================================
@@ -483,6 +548,15 @@ def _collect_valuation(ticker, preco_atual=np.nan):
         "pvp_data": np.nan,
         "vp_cota_data": np.nan,
         "fonte_valuation": "SEM_DADO",
+
+        "cnpj_cvm": np.nan,
+        "nome_cvm": np.nan,
+        "data_referencia_cvm": pd.NaT,
+        "pl_cvm": np.nan,
+        "cotas_emitidas_cvm": np.nan,
+        "cotistas_cvm": np.nan,
+        "score_match_cvm": np.nan,
+        "cobertura_match_cvm": np.nan,
     }
 
     symbol = f"{ticker}.SA"
@@ -580,6 +654,653 @@ def _collect_valuation(ticker, preco_atual=np.nan):
 
     except Exception:
         pass
+
+    return result
+
+
+def _normalize_text(value):
+
+    if value is None:
+        return ""
+
+    text = str(value).upper().strip()
+
+    text = unicodedata.normalize(
+        "NFKD",
+        text
+    )
+
+    text = "".join(
+        ch
+        for ch in text
+        if not unicodedata.combining(ch)
+    )
+
+    text = re.sub(
+        r"[^A-Z0-9 ]+",
+        " ",
+        text
+    )
+
+    stop_words = {
+        "FUNDO",
+        "FUNDOS",
+        "DE",
+        "DO",
+        "DA",
+        "DOS",
+        "DAS",
+        "INVESTIMENTO",
+        "INVESTIMENTOS",
+        "IMOBILIARIO",
+        "IMOBILIARIA",
+        "FII",
+        "RL",
+        "RESPONSABILIDADE",
+        "LIMITADA",
+        "CLASSE",
+        "COTAS",
+        "COTA",
+    }
+
+    tokens = [
+        tok
+        for tok in text.split()
+        if tok not in stop_words
+    ]
+
+    return " ".join(tokens)
+
+
+def _normalize_header(value):
+
+    return (
+        _normalize_text(value)
+        .replace(" ", "_")
+    )
+
+
+def _first_existing_column(columns, candidates):
+
+    normalized = {
+        _normalize_header(col): col
+        for col in columns
+    }
+
+    for candidate in candidates:
+
+        candidate_norm = (
+            _normalize_header(candidate)
+        )
+
+        if candidate_norm in normalized:
+            return normalized[
+                candidate_norm
+            ]
+
+    # fallback por conteúdo parcial
+    for norm_name, original in normalized.items():
+
+        for candidate in candidates:
+
+            candidate_norm = (
+                _normalize_header(candidate)
+            )
+
+            if (
+                candidate_norm
+                and candidate_norm in norm_name
+            ):
+                return original
+
+    return None
+
+
+def _read_cvm_csv_from_zip(zf, member):
+
+    raw = zf.read(
+        member
+    )
+
+    for encoding in (
+        "utf-8-sig",
+        "latin1",
+        "cp1252",
+    ):
+
+        try:
+
+            return pd.read_csv(
+                io.BytesIO(raw),
+                sep=";",
+                encoding=encoding,
+                low_memory=False,
+            )
+
+        except Exception:
+            pass
+
+    return pd.DataFrame()
+
+
+def _download_cvm_monthly_base():
+
+    try:
+
+        request = Request(
+            CVM_FII_MONTHLY_URL,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 "
+                    "FII-Institutional-Scanner/1.0"
+                )
+            },
+        )
+
+        with urlopen(
+            request,
+            timeout=45,
+        ) as response:
+
+            content = response.read()
+
+    except Exception as exc:
+
+        print(
+            "[AVISO] CVM | falha ao baixar "
+            f"Informe Mensal: {exc}"
+        )
+
+        return pd.DataFrame()
+
+    try:
+
+        zf = zipfile.ZipFile(
+            io.BytesIO(content)
+        )
+
+    except Exception as exc:
+
+        print(
+            "[AVISO] CVM | ZIP inválido: "
+            f"{exc}"
+        )
+
+        return pd.DataFrame()
+
+    pieces = []
+
+    for member in zf.namelist():
+
+        if not member.lower().endswith(".csv"):
+            continue
+
+        df = _read_cvm_csv_from_zip(
+            zf,
+            member
+        )
+
+        if df.empty:
+            continue
+
+        cnpj_col = _first_existing_column(
+            df.columns,
+            [
+                "CNPJ_Fundo_Classe",
+                "CNPJ_Fundo",
+                "CNPJ",
+            ]
+        )
+
+        date_col = _first_existing_column(
+            df.columns,
+            [
+                "Data_Referencia",
+                "DT_COMPTC",
+                "Data_Competencia",
+            ]
+        )
+
+        name_col = _first_existing_column(
+            df.columns,
+            [
+                "Nome_Fundo_Classe",
+                "Nome_Fundo",
+                "Denominacao_Social",
+                "DENOM_SOCIAL",
+            ]
+        )
+
+        pl_col = _first_existing_column(
+            df.columns,
+            [
+                "Patrimonio_Liquido",
+                "VL_PATRIM_LIQ",
+            ]
+        )
+
+        shares_col = _first_existing_column(
+            df.columns,
+            [
+                "Cotas_Emitidas",
+                "Numero_Cotas_Emitidas",
+                "Qtd_Cotas_Emitidas",
+            ]
+        )
+
+        cotistas_col = _first_existing_column(
+            df.columns,
+            [
+                "Total_Numero_Cotistas",
+                "Numero_Cotistas",
+                "NR_COTST",
+            ]
+        )
+
+        # Só aproveitamos arquivos que possuam identificador e
+        # pelo menos uma informação econômica relevante.
+        if (
+            cnpj_col is None
+            or date_col is None
+            or (
+                pl_col is None
+                and shares_col is None
+                and cotistas_col is None
+            )
+        ):
+            continue
+
+        out = pd.DataFrame()
+
+        out[
+            "cnpj_cvm"
+        ] = (
+            df[
+                cnpj_col
+            ]
+            .astype(str)
+            .str.replace(
+                r"\D",
+                "",
+                regex=True
+            )
+        )
+
+        out[
+            "data_referencia_cvm"
+        ] = pd.to_datetime(
+            df[
+                date_col
+            ],
+            errors="coerce"
+        )
+
+        if name_col is not None:
+
+            out[
+                "nome_cvm"
+            ] = (
+                df[
+                    name_col
+                ]
+                .astype(str)
+            )
+
+        else:
+
+            out[
+                "nome_cvm"
+            ] = np.nan
+
+        if pl_col is not None:
+
+            out[
+                "pl_cvm"
+            ] = pd.to_numeric(
+                df[
+                    pl_col
+                ],
+                errors="coerce"
+            )
+
+        else:
+
+            out[
+                "pl_cvm"
+            ] = np.nan
+
+        if shares_col is not None:
+
+            out[
+                "cotas_emitidas_cvm"
+            ] = pd.to_numeric(
+                df[
+                    shares_col
+                ],
+                errors="coerce"
+            )
+
+        else:
+
+            out[
+                "cotas_emitidas_cvm"
+            ] = np.nan
+
+        if cotistas_col is not None:
+
+            out[
+                "cotistas_cvm"
+            ] = pd.to_numeric(
+                df[
+                    cotistas_col
+                ],
+                errors="coerce"
+            )
+
+        else:
+
+            out[
+                "cotistas_cvm"
+            ] = np.nan
+
+        out = out[
+            out[
+                "cnpj_cvm"
+            ].str.len() == 14
+        ]
+
+        if not out.empty:
+            pieces.append(
+                out
+            )
+
+    if not pieces:
+
+        print(
+            "[AVISO] CVM | nenhuma tabela útil "
+            "foi identificada no ZIP."
+        )
+
+        return pd.DataFrame()
+
+    base = pd.concat(
+        pieces,
+        ignore_index=True
+    )
+
+    # Combina tabela geral e complementos pela mesma chave.
+    def first_valid(series):
+
+        valid = series.dropna()
+
+        if valid.empty:
+            return np.nan
+
+        return valid.iloc[-1]
+
+    base = (
+        base
+        .sort_values(
+            [
+                "cnpj_cvm",
+                "data_referencia_cvm",
+            ]
+        )
+        .groupby(
+            [
+                "cnpj_cvm",
+                "data_referencia_cvm",
+            ],
+            as_index=False,
+        )
+        .agg(
+            {
+                "nome_cvm": first_valid,
+                "pl_cvm": first_valid,
+                "cotas_emitidas_cvm": first_valid,
+                "cotistas_cvm": first_valid,
+            }
+        )
+    )
+
+    return base
+
+
+def _alias_match_score(alias, candidate):
+
+    a = _normalize_text(
+        alias
+    )
+
+    b = _normalize_text(
+        candidate
+    )
+
+    if not a or not b:
+        return 0.0, 0.0
+
+    a_tokens = set(
+        a.split()
+    )
+
+    b_tokens = set(
+        b.split()
+    )
+
+    if not a_tokens:
+        return 0.0, 0.0
+
+    coverage = (
+        len(
+            a_tokens
+            &
+            b_tokens
+        )
+        /
+        len(
+            a_tokens
+        )
+    )
+
+    similarity = (
+        SequenceMatcher(
+            None,
+            a,
+            b
+        )
+        .ratio()
+    )
+
+    score = (
+        coverage * 0.75
+        +
+        similarity * 0.25
+    )
+
+    return score, coverage
+
+
+def _build_cvm_valuation_map(tickers, prices):
+
+    cvm = _download_cvm_monthly_base()
+
+    if cvm.empty:
+        return {}
+
+    # Mantém apenas a observação mais recente de cada CNPJ.
+    cvm = (
+        cvm
+        .sort_values(
+            "data_referencia_cvm"
+        )
+        .groupby(
+            "cnpj_cvm",
+            as_index=False
+        )
+        .tail(1)
+        .reset_index(
+            drop=True
+        )
+    )
+
+    result = {}
+
+    for ticker in tickers:
+
+        alias = FII_CVM_ALIASES.get(
+            ticker
+        )
+
+        if not alias:
+            continue
+
+        scored = []
+
+        for idx, row in cvm.iterrows():
+
+            score, coverage = (
+                _alias_match_score(
+                    alias,
+                    row.get(
+                        "nome_cvm",
+                        ""
+                    )
+                )
+            )
+
+            if coverage >= 0.66:
+
+                scored.append(
+                    (
+                        score,
+                        coverage,
+                        idx,
+                    )
+                )
+
+        if not scored:
+            continue
+
+        scored.sort(
+            reverse=True
+        )
+
+        best_score, best_coverage, best_idx = (
+            scored[0]
+        )
+
+        second_score = (
+            scored[1][0]
+            if len(scored) > 1
+            else 0.0
+        )
+
+        margin = (
+            best_score
+            -
+            second_score
+        )
+
+        # Regra conservadora:
+        # - alias quase completo, ou
+        # - cobertura boa + score alto + margem suficiente.
+        accepted = (
+            (
+                best_coverage >= 0.95
+                and best_score >= 0.78
+            )
+            or
+            (
+                best_coverage >= 0.75
+                and best_score >= 0.80
+                and margin >= 0.03
+            )
+        )
+
+        if not accepted:
+            continue
+
+        row = cvm.loc[
+            best_idx
+        ]
+
+        pl = _safe_float(
+            row.get(
+                "pl_cvm"
+            )
+        )
+
+        cotas = _safe_float(
+            row.get(
+                "cotas_emitidas_cvm"
+            )
+        )
+
+        preco = _safe_float(
+            prices.get(
+                ticker,
+                np.nan
+            )
+        )
+
+        if (
+            not np.isfinite(pl)
+            or pl <= 0
+            or not np.isfinite(cotas)
+            or cotas <= 0
+            or not np.isfinite(preco)
+            or preco <= 0
+        ):
+            continue
+
+        vp_cota = (
+            pl
+            /
+            cotas
+        )
+
+        pvp = (
+            preco
+            /
+            vp_cota
+        )
+
+        # Sanidade contábil. Valores fora desta faixa ficam
+        # para revisão e não entram automaticamente no score.
+        if (
+            not np.isfinite(vp_cota)
+            or vp_cota <= 0
+            or not np.isfinite(pvp)
+            or pvp < 0.05
+            or pvp > 5.0
+        ):
+            continue
+
+        result[
+            ticker
+        ] = {
+            "pvp_data": pvp,
+            "vp_cota_data": vp_cota,
+            "fonte_valuation": "CVM_OFICIAL",
+            "cnpj_cvm": row.get(
+                "cnpj_cvm"
+            ),
+            "nome_cvm": row.get(
+                "nome_cvm"
+            ),
+            "data_referencia_cvm": row.get(
+                "data_referencia_cvm"
+            ),
+            "pl_cvm": pl,
+            "cotas_emitidas_cvm": cotas,
+            "cotistas_cvm": _safe_float(
+                row.get(
+                    "cotistas_cvm"
+                )
+            ),
+            "score_match_cvm": best_score,
+            "cobertura_match_cvm": best_coverage,
+        }
 
     return result
 
@@ -1204,6 +1925,21 @@ def _print_audit(df):
 
         print()
         print(
+            "FONTES DE VALUATION"
+        )
+
+        print(
+            valuation_ok[
+                "fonte_valuation"
+            ]
+            .value_counts(
+                dropna=False
+            )
+            .to_string()
+        )
+
+        print()
+        print(
             "COBERTURA DE VALUATION"
         )
 
@@ -1214,6 +1950,8 @@ def _print_audit(df):
                     "pvp_data",
                     "vp_cota_data",
                     "fonte_valuation",
+                    "data_referencia_cvm",
+                    "score_match_cvm",
                 ]
             ]
             .sort_values(
@@ -1420,6 +2158,91 @@ def build_database():
         records
     )
 
+    # ========================================================
+    # FALLBACK OFICIAL CVM — UMA COLETA POR EXECUÇÃO
+    # ========================================================
+
+    prices_map = (
+        database
+        .set_index(
+            "ticker"
+        )[
+            "preco"
+        ]
+        .to_dict()
+    )
+
+    missing_pvp_tickers = (
+        database.loc[
+            pd.to_numeric(
+                database[
+                    "pvp_data"
+                ],
+                errors="coerce"
+            ).isna(),
+            "ticker",
+        ]
+        .tolist()
+    )
+
+    if missing_pvp_tickers:
+
+        print()
+        print(
+            "CVM — buscando valuation oficial "
+            f"para {len(missing_pvp_tickers)} FIIs..."
+        )
+
+        cvm_map = (
+            _build_cvm_valuation_map(
+                missing_pvp_tickers,
+                prices_map
+            )
+        )
+
+        for ticker, cvm_data in cvm_map.items():
+
+            mask = (
+                database[
+                    "ticker"
+                ] == ticker
+            )
+
+            for key, value in cvm_data.items():
+
+                if key not in database.columns:
+                    database[
+                        key
+                    ] = np.nan
+
+                database.loc[
+                    mask,
+                    key
+                ] = value
+
+            valuation_cache[
+                ticker
+            ] = {
+                "pvp_data": cvm_data.get(
+                    "pvp_data",
+                    np.nan
+                ),
+                "vp_cota_data": cvm_data.get(
+                    "vp_cota_data",
+                    np.nan
+                ),
+                "fonte_valuation": (
+                    "CVM_OFICIAL"
+                ),
+            }
+
+        print(
+            "CVM — valuations recuperados:",
+            len(
+                cvm_map
+            )
+        )
+
     _save_valuation_cache(
         valuation_cache
     )
@@ -1441,6 +2264,11 @@ def build_database():
         "eventos_estruturais_detectados",
         "pvp_data",
         "vp_cota_data",
+        "pl_cvm",
+        "cotas_emitidas_cvm",
+        "cotistas_cvm",
+        "score_match_cvm",
+        "cobertura_match_cvm",
     ]
 
     for col in numeric_columns:
