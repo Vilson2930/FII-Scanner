@@ -1,1 +1,187 @@
+name: FII Institutional Scanner
 
+on:
+  workflow_dispatch:
+
+  schedule:
+    # 23:30 UTC
+    # Aproximadamente 20:30 no horário de Brasília
+    - cron: "30 23 * * 1-5"
+
+
+permissions:
+  contents: read
+
+
+jobs:
+
+  run-scanner:
+
+    runs-on: ubuntu-latest
+
+    timeout-minutes: 30
+
+
+    steps:
+
+      # ======================================================
+      # 1. CHECKOUT
+      # ======================================================
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+
+      # ======================================================
+      # 2. PYTHON
+      # ======================================================
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+
+      # ======================================================
+      # 3. DEPENDÊNCIAS
+      # ======================================================
+
+      - name: Install dependencies
+
+        run: |
+
+          python -m pip install --upgrade pip
+
+          pip install -r requirements.txt
+
+
+      # ======================================================
+      # 4. DIRETÓRIOS
+      # ======================================================
+
+      - name: Prepare directories
+
+        run: |
+
+          mkdir -p data
+          mkdir -p reports
+
+
+      # ======================================================
+      # 5. EXECUTA SCANNER
+      # ======================================================
+
+      - name: Run FII Institutional Scanner
+
+        run: |
+
+          python main.py
+
+
+      # ======================================================
+      # 6. AUDITORIA DE ARQUIVOS
+      # ======================================================
+
+      - name: Check generated files
+
+        run: |
+
+          echo "=============================="
+          echo "DATA"
+          echo "=============================="
+
+          ls -lah data || true
+
+          echo ""
+
+          echo "=============================="
+          echo "REPORTS"
+          echo "=============================="
+
+          ls -lah reports || true
+
+
+      # ======================================================
+      # 7. UPLOAD DO RANKING
+      # ======================================================
+
+      - name: Upload ranking
+
+        if: always()
+
+        uses: actions/upload-artifact@v4
+
+        with:
+
+          name: fii-ranking
+
+          path: data/ranking.csv
+
+          if-no-files-found: warn
+
+          retention-days: 30
+
+
+      # ======================================================
+      # 8. UPLOAD DO PORTFÓLIO
+      # ======================================================
+
+      - name: Upload portfolio
+
+        if: always()
+
+        uses: actions/upload-artifact@v4
+
+        with:
+
+          name: fii-portfolio
+
+          path: data/portfolio.csv
+
+          if-no-files-found: warn
+
+          retention-days: 30
+
+
+      # ======================================================
+      # 9. UPLOAD DO UNIVERSO
+      # ======================================================
+
+      - name: Upload universe
+
+        if: always()
+
+        uses: actions/upload-artifact@v4
+
+        with:
+
+          name: fii-universe
+
+          path: data/universe.csv
+
+          if-no-files-found: warn
+
+          retention-days: 30
+
+
+      # ======================================================
+      # 10. UPLOAD DO RELATÓRIO
+      # ======================================================
+
+      - name: Upload PDF report
+
+        if: always()
+
+        uses: actions/upload-artifact@v4
+
+        with:
+
+          name: fii-institutional-report
+
+          path: reports/fii_report.pdf
+
+          if-no-files-found: warn
+
+          retention-days: 30
