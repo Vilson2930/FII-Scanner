@@ -47,6 +47,7 @@ STRUCTURAL_WINDOW = 5
 STRUCTURAL_FACTOR_TOLERANCE = 0.20
 
 HISTORY_CLEAN_DIR = Path(DATA_DIR) / "history_clean"
+VALUATION_CACHE_FILE = Path(DATA_DIR) / "valuation_cache.csv"
 
 
 # ============================================================
@@ -384,6 +385,205 @@ def _save_clean_history(ticker, history):
     )
 
 
+def _load_valuation_cache():
+
+    if not VALUATION_CACHE_FILE.exists():
+        return {}
+
+    try:
+
+        cache = pd.read_csv(
+            VALUATION_CACHE_FILE
+        )
+
+        if cache.empty or "ticker" not in cache.columns:
+            return {}
+
+        records = {}
+
+        for _, row in cache.iterrows():
+
+            ticker = str(
+                row.get(
+                    "ticker",
+                    ""
+                )
+            ).strip()
+
+            if not ticker:
+                continue
+
+            records[ticker] = {
+                "pvp_data": _safe_float(
+                    row.get(
+                        "pvp_data"
+                    )
+                ),
+                "vp_cota_data": _safe_float(
+                    row.get(
+                        "vp_cota_data"
+                    )
+                ),
+                "fonte_valuation": row.get(
+                    "fonte_valuation",
+                    "CACHE"
+                ),
+            }
+
+        return records
+
+    except Exception:
+        return {}
+
+
+def _save_valuation_cache(records):
+
+    if not records:
+        return
+
+    Path(DATA_DIR).mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    rows = []
+
+    for ticker, data in records.items():
+
+        rows.append(
+            {
+                "ticker": ticker,
+                "pvp_data": data.get(
+                    "pvp_data",
+                    np.nan
+                ),
+                "vp_cota_data": data.get(
+                    "vp_cota_data",
+                    np.nan
+                ),
+                "fonte_valuation": data.get(
+                    "fonte_valuation",
+                    "SEM_DADO"
+                ),
+            }
+        )
+
+    pd.DataFrame(
+        rows
+    ).to_csv(
+        VALUATION_CACHE_FILE,
+        index=False,
+        encoding="utf-8-sig"
+    )
+
+
+def _collect_valuation(ticker, preco_atual=np.nan):
+
+    result = {
+        "pvp_data": np.nan,
+        "vp_cota_data": np.nan,
+        "fonte_valuation": "SEM_DADO",
+    }
+
+    symbol = f"{ticker}.SA"
+
+    try:
+
+        tk = yf.Ticker(
+            symbol
+        )
+
+        info = {}
+
+        try:
+            info = tk.get_info() or {}
+        except Exception:
+            try:
+                info = tk.info or {}
+            except Exception:
+                info = {}
+
+        # 1) P/VP direto
+        pvp = _safe_float(
+            info.get(
+                "priceToBook"
+            )
+        )
+
+        if np.isfinite(pvp) and pvp > 0:
+
+            result[
+                "pvp_data"
+            ] = pvp
+
+            result[
+                "fonte_valuation"
+            ] = "YAHOO_PRICE_TO_BOOK"
+
+            if (
+                np.isfinite(preco_atual)
+                and preco_atual > 0
+            ):
+
+                result[
+                    "vp_cota_data"
+                ] = (
+                    preco_atual
+                    /
+                    pvp
+                )
+
+            return result
+
+        # 2) Book value por cota
+        book_value = _safe_float(
+            info.get(
+                "bookValue"
+            )
+        )
+
+        price = _safe_float(
+            preco_atual
+        )
+
+        if (
+            np.isfinite(book_value)
+            and book_value > 0
+            and np.isfinite(price)
+            and price > 0
+        ):
+
+            pvp_calc = (
+                price
+                /
+                book_value
+            )
+
+            if (
+                np.isfinite(pvp_calc)
+                and pvp_calc > 0
+            ):
+
+                result[
+                    "pvp_data"
+                ] = pvp_calc
+
+                result[
+                    "vp_cota_data"
+                ] = book_value
+
+                result[
+                    "fonte_valuation"
+                ] = "YAHOO_BOOK_VALUE"
+
+                return result
+
+    except Exception:
+        pass
+
+    return result
+
+
 def _download_history(ticker):
 
     yahoo_ticker = f"{ticker}.SA"
@@ -688,6 +888,12 @@ def _calculate_market_metrics(ticker, history):
         "dados_preco_ok": False,
 
         "status_coleta": "SEM_DADOS",
+
+        "pvp_data": np.nan,
+
+        "vp_cota_data": np.nan,
+
+        "fonte_valuation": "SEM_DADO",
     }
 
     if history.empty:
@@ -978,6 +1184,46 @@ def _print_audit(df):
         )
     )
 
+    valuation_ok = df[
+        pd.to_numeric(
+            df[
+                "pvp_data"
+            ],
+            errors="coerce"
+        ).notna()
+    ]
+
+    print(
+        "P/VP disponível no Data Engine:",
+        len(
+            valuation_ok
+        )
+    )
+
+    if not valuation_ok.empty:
+
+        print()
+        print(
+            "COBERTURA DE VALUATION"
+        )
+
+        print(
+            valuation_ok[
+                [
+                    "ticker",
+                    "pvp_data",
+                    "vp_cota_data",
+                    "fonte_valuation",
+                ]
+            ]
+            .sort_values(
+                "ticker"
+            )
+            .to_string(
+                index=False
+            )
+        )
+
     if not failed_collection.empty:
 
         print()
@@ -1064,6 +1310,10 @@ def build_database():
 
     records = []
 
+    valuation_cache = (
+        _load_valuation_cache()
+    )
+
 
     for ticker, (
         categoria,
@@ -1084,6 +1334,75 @@ def build_database():
             )
         )
 
+        valuation = (
+            _collect_valuation(
+                ticker,
+                metrics.get(
+                    "preco",
+                    np.nan
+                )
+            )
+        )
+
+        # Se a coleta atual não encontrou valuation,
+        # reaproveitamos somente um valor previamente confirmado.
+        if (
+            not np.isfinite(
+                _safe_float(
+                    valuation.get(
+                        "pvp_data"
+                    )
+                )
+            )
+        ):
+
+            cached = valuation_cache.get(
+                ticker,
+                {}
+            )
+
+            cached_pvp = _safe_float(
+                cached.get(
+                    "pvp_data"
+                )
+            )
+
+            if (
+                np.isfinite(cached_pvp)
+                and cached_pvp > 0
+            ):
+
+                valuation = {
+                    "pvp_data": cached_pvp,
+                    "vp_cota_data": _safe_float(
+                        cached.get(
+                            "vp_cota_data"
+                        )
+                    ),
+                    "fonte_valuation": "CACHE_VALIDADO",
+                }
+
+        metrics.update(
+            valuation
+        )
+
+        valuation_cache[
+            ticker
+        ] = {
+            "pvp_data": metrics.get(
+                "pvp_data",
+                np.nan
+            ),
+            "vp_cota_data": metrics.get(
+                "vp_cota_data",
+                np.nan
+            ),
+            "fonte_valuation": metrics.get(
+                "fonte_valuation",
+                "SEM_DADO"
+            ),
+        }
+
         metrics[
             "categoria_motor"
         ] = categoria
@@ -1101,6 +1420,10 @@ def build_database():
         records
     )
 
+    _save_valuation_cache(
+        valuation_cache
+    )
+
 
     # ========================================================
     # TIPOS
@@ -1116,6 +1439,8 @@ def build_database():
         "maior_retorno_abs",
         "eventos_extremos",
         "eventos_estruturais_detectados",
+        "pvp_data",
+        "vp_cota_data",
     ]
 
     for col in numeric_columns:
