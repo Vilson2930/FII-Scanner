@@ -1,1 +1,9 @@
-
+pandas>=2.2.0
+numpy>=1.26.0
+yfinance>=0.2.54
+scipy>=1.12.0
+scikit-learn>=1.4.0
+reportlab>=4.2.0
+matplotlib>=3.8.0
+python-dateutil>=2.9.0
+tqdm>=4.66.0
