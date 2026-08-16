@@ -383,6 +383,70 @@ def _enrich_fundamentals(database):
 
     )
 
+    # ========================================================
+    # INTEGRAÇÃO DO VALUATION DO DATA ENGINE
+    # ========================================================
+    #
+    # Prioridade:
+    # 1) P/VP obtido nesta etapa pelo Yahoo;
+    # 2) P/VP já validado/coletado no Data Engine
+    #    (Yahoo ou CVM oficial);
+    # 3) permanece NaN.
+    #
+    if "pvp_data" in base.columns:
+
+        pvp_local = pd.to_numeric(
+            base[
+                "pvp"
+            ],
+            errors="coerce"
+        )
+
+        pvp_data_engine = pd.to_numeric(
+            base[
+                "pvp_data"
+            ],
+            errors="coerce"
+        )
+
+        base[
+            "pvp"
+        ] = pvp_local.fillna(
+            pvp_data_engine
+        )
+
+    # Também preservamos a origem do valuation para auditoria.
+    if "fonte_valuation" not in base.columns:
+
+        base[
+            "fonte_valuation"
+        ] = np.nan
+
+    base[
+        "fonte_valuation_final"
+    ] = np.where(
+        pd.to_numeric(
+            extras.set_index(
+                "ticker"
+            )[
+                "pvp"
+            ].reindex(
+                base[
+                    "ticker"
+                ]
+            ).reset_index(
+                drop=True
+            ),
+            errors="coerce"
+        ).notna(),
+        "YAHOO_FUNDAMENTAL",
+        base[
+            "fonte_valuation"
+        ].fillna(
+            "SEM_DADO"
+        )
+    )
+
 
     return base
 
@@ -1751,6 +1815,8 @@ def run_fundamental_engine(database):
         "dy_12m",
 
         "pvp",
+
+        "fonte_valuation_final",
 
         "status_valuation",
 
