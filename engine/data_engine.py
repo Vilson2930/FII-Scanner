@@ -33,6 +33,23 @@ warnings.filterwarnings("ignore")
 
 
 # ============================================================
+# HIGIENE DE SÉRIE / EVENTOS ESTRUTURAIS
+# ============================================================
+#
+# Objetivo:
+# - detectar saltos incompatíveis com movimento normal de mercado;
+# - diferenciar um evento estrutural persistente de uma oscilação real;
+# - retroajustar o histórico anterior ao evento, preservando o nível atual;
+# - nunca "apagar" silenciosamente retornos normais.
+#
+STRUCTURAL_JUMP_MIN = 0.50
+STRUCTURAL_WINDOW = 5
+STRUCTURAL_FACTOR_TOLERANCE = 0.20
+
+HISTORY_CLEAN_DIR = Path(DATA_DIR) / "history_clean"
+
+
+# ============================================================
 # UNIVERSO INICIAL
 # ============================================================
 
@@ -141,6 +158,232 @@ def _normalize_columns(df):
     return df
 
 
+def _detect_structural_events(df):
+
+    events = []
+
+    if df is None or df.empty:
+        return events
+
+    if "Close" not in df.columns:
+        return events
+
+    close = pd.to_numeric(
+        df["Close"],
+        errors="coerce"
+    )
+
+    valid = close.dropna()
+
+    if len(valid) < (
+        STRUCTURAL_WINDOW * 2 + 2
+    ):
+        return events
+
+    returns = (
+        valid
+        .pct_change(fill_method=None)
+    )
+
+    candidate_dates = returns[
+        returns.abs() >= STRUCTURAL_JUMP_MIN
+    ].index
+
+    for event_date in candidate_dates:
+
+        loc = valid.index.get_loc(
+            event_date
+        )
+
+        if isinstance(loc, slice):
+            continue
+
+        if loc < STRUCTURAL_WINDOW:
+            continue
+
+        if (
+            loc + STRUCTURAL_WINDOW
+            >= len(valid)
+        ):
+            continue
+
+        before = valid.iloc[
+            loc - STRUCTURAL_WINDOW:
+            loc
+        ]
+
+        after = valid.iloc[
+            loc:
+            loc + STRUCTURAL_WINDOW
+        ]
+
+        if before.empty or after.empty:
+            continue
+
+        before_med = float(
+            before.median()
+        )
+
+        after_med = float(
+            after.median()
+        )
+
+        if (
+            before_med <= 0
+            or after_med <= 0
+        ):
+            continue
+
+        factor = (
+            after_med
+            /
+            before_med
+        )
+
+        jump_factor = (
+            valid.iloc[loc]
+            /
+            valid.iloc[loc - 1]
+        )
+
+        # Um evento estrutural verdadeiro tende a criar um
+        # novo patamar persistente. Ex.: grupamento/desdobramento
+        # ou erro de escala na origem de dados.
+        persistence_error = abs(
+            factor - jump_factor
+        ) / max(
+            abs(jump_factor),
+            1e-12
+        )
+
+        if (
+            persistence_error
+            <= STRUCTURAL_FACTOR_TOLERANCE
+            and (
+                factor >= 1.50
+                or factor <= (1 / 1.50)
+            )
+        ):
+
+            events.append(
+                {
+                    "date": event_date,
+                    "factor": float(factor),
+                    "jump_return": float(
+                        returns.loc[event_date]
+                    ),
+                    "persistence_error": float(
+                        persistence_error
+                    ),
+                }
+            )
+
+    return events
+
+
+def _repair_structural_events(ticker, df):
+
+    if df is None or df.empty:
+        return df, []
+
+    clean = df.copy()
+
+    events = _detect_structural_events(
+        clean
+    )
+
+    if not events:
+        return clean, []
+
+    # Aplicamos em ordem cronológica.
+    events = sorted(
+        events,
+        key=lambda x: x["date"]
+    )
+
+    price_columns = [
+        col
+        for col in [
+            "Open",
+            "High",
+            "Low",
+            "Close",
+        ]
+        if col in clean.columns
+    ]
+
+    adjusted_events = []
+
+    for event in events:
+
+        event_date = event["date"]
+        factor = event["factor"]
+
+        if (
+            not np.isfinite(factor)
+            or factor <= 0
+        ):
+            continue
+
+        mask_prior = (
+            clean.index
+            <
+            event_date
+        )
+
+        if not mask_prior.any():
+            continue
+
+        # Retroajuste: traz o histórico antigo para a mesma
+        # escala do patamar posterior, preservando o preço atual.
+        clean.loc[
+            mask_prior,
+            price_columns
+        ] = (
+            clean.loc[
+                mask_prior,
+                price_columns
+            ]
+            * factor
+        )
+
+        adjusted_events.append(
+            event
+        )
+
+        print(
+            f"[EVENTO ESTRUTURAL] {ticker} | "
+            f"{pd.Timestamp(event_date).date()} | "
+            f"retorno bruto={event['jump_return']:+.2%} | "
+            f"fator={factor:.4f} | "
+            f"histórico anterior retroajustado."
+        )
+
+    return clean, adjusted_events
+
+
+def _save_clean_history(ticker, history):
+
+    if history is None or history.empty:
+        return
+
+    HISTORY_CLEAN_DIR.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    output = (
+        HISTORY_CLEAN_DIR
+        /
+        f"{ticker}.csv"
+    )
+
+    history.to_csv(
+        output,
+        encoding="utf-8-sig"
+    )
+
+
 def _download_history(ticker):
 
     yahoo_ticker = f"{ticker}.SA"
@@ -209,6 +452,22 @@ def _download_history(ticker):
                             f"na tentativa {attempt}."
                         )
 
+                    df, structural_events = (
+                        _repair_structural_events(
+                            ticker,
+                            df
+                        )
+                    )
+
+                    df.attrs[
+                        "structural_events"
+                    ] = structural_events
+
+                    _save_clean_history(
+                        ticker,
+                        df
+                    )
+
                     return df
 
         except Exception as exc:
@@ -266,6 +525,22 @@ def _download_history(ticker):
                     print(
                         f"[RECUPERADO] {ticker} "
                         f"via Ticker.history."
+                    )
+
+                    df_alt, structural_events = (
+                        _repair_structural_events(
+                            ticker,
+                            df_alt
+                        )
+                    )
+
+                    df_alt.attrs[
+                        "structural_events"
+                    ] = structural_events
+
+                    _save_clean_history(
+                        ticker,
+                        df_alt
                     )
 
                     return df_alt
@@ -344,6 +619,22 @@ def _download_history(ticker):
                     f"na última tentativa sem repair."
                 )
 
+                df, structural_events = (
+                    _repair_structural_events(
+                        ticker,
+                        df
+                    )
+                )
+
+                df.attrs[
+                    "structural_events"
+                ] = structural_events
+
+                _save_clean_history(
+                    ticker,
+                    df
+                )
+
                 return df
 
     except Exception as exc:
@@ -392,6 +683,8 @@ def _calculate_market_metrics(ticker, history):
 
         "eventos_extremos": 0,
 
+        "eventos_estruturais_detectados": 0,
+
         "dados_preco_ok": False,
 
         "status_coleta": "SEM_DADOS",
@@ -402,6 +695,17 @@ def _calculate_market_metrics(ticker, history):
 
     if "Close" not in history.columns:
         return result
+
+    structural_events = history.attrs.get(
+        "structural_events",
+        []
+    )
+
+    result[
+        "eventos_estruturais_detectados"
+    ] = len(
+        structural_events
+    )
 
     close = pd.to_numeric(
         history["Close"],
@@ -644,9 +948,20 @@ def _print_audit(df):
         df["eventos_extremos"] > 0
     ]
 
+    structural = df[
+        df[
+            "eventos_estruturais_detectados"
+        ] > 0
+    ]
+
     print(
         "Com evento diário extremo  :",
         len(extreme)
+    )
+
+    print(
+        "Com evento estrutural corrigido:",
+        len(structural)
     )
 
 
@@ -684,11 +999,34 @@ def _print_audit(df):
         )
 
 
+    if not structural.empty:
+
+        print()
+        print(
+            "EVENTOS ESTRUTURAIS CORRIGIDOS"
+        )
+
+        print(
+            structural[
+                [
+                    "ticker",
+                    "eventos_estruturais_detectados",
+                    "maior_retorno_abs",
+                    "volatilidade_anual",
+                    "drawdown_5a",
+                ]
+            ]
+            .to_string(
+                index=False
+            )
+        )
+
+
     if not extreme.empty:
 
         print()
         print(
-            "ATENÇÃO — EVENTOS EXTREMOS"
+            "ATENÇÃO — EVENTOS EXTREMOS APÓS HIGIENE"
         )
 
         cols = [
@@ -777,6 +1115,7 @@ def build_database():
         "drawdown_5a",
         "maior_retorno_abs",
         "eventos_extremos",
+        "eventos_estruturais_detectados",
     ]
 
     for col in numeric_columns:
