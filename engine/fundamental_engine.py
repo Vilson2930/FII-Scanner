@@ -542,9 +542,11 @@ def _score_valuation(row):
 
     if pd.isna(pvp):
 
-        # dado ausente não pode destruir o fundo,
-        # mas também não recebe bônus.
-        return 70
+        # Dado ausente = incerteza.
+        # Não premiamos o fundo por uma informação que não temos.
+        # O valor 50 é neutro e a ausência também reduz a
+        # confiança dos dados e gera penalidade de qualidade.
+        return 50
 
 
     # --------------------------------------------------------
@@ -1247,6 +1249,12 @@ def _data_confidence(row):
             )
         ),
 
+        pd.notna(
+            row.get(
+                "pvp"
+            )
+        ),
+
     ]
 
 
@@ -1258,7 +1266,36 @@ def _data_confidence(row):
 
 
 # ============================================================
-# 16. CLASSIFICAÇÃO
+# 16. PENALIDADE DE QUALIDADE DOS DADOS
+# ============================================================
+
+def _data_quality_penalty(row):
+
+    penalty = 0.0
+
+    # Valuation ausente não é falha econômica do fundo,
+    # mas reduz a convicção do ranking.
+    if pd.isna(
+        row.get(
+            "pvp"
+        )
+    ):
+        penalty -= 5.0
+
+    # Dividendos sem histórico comparável de crescimento
+    # recebem apenas pequena penalidade de incerteza.
+    if pd.isna(
+        row.get(
+            "crescimento_dividendos"
+        )
+    ):
+        penalty -= 2.0
+
+    return penalty
+
+
+# ============================================================
+# 17. CLASSIFICAÇÃO
 # ============================================================
 
 def _classification(score, risco_especial):
@@ -1310,7 +1347,7 @@ def _classification(score, risco_especial):
 
 
 # ============================================================
-# 17. MOTOR PRINCIPAL
+# 18. MOTOR PRINCIPAL
 # ============================================================
 
 def run_fundamental_engine(database):
@@ -1402,6 +1439,14 @@ def run_fundamental_engine(database):
     )
 
 
+    base[
+        "penalidade_qualidade_dados"
+    ] = base.apply(
+        _data_quality_penalty,
+        axis=1
+    )
+
+
     # ========================================================
     # SCORE FINAL
     # ========================================================
@@ -1418,6 +1463,12 @@ def run_fundamental_engine(database):
 
         base[
             "penalidades_totais"
+        ]
+
+        +
+
+        base[
+            "penalidade_qualidade_dados"
         ]
 
     ).clip(
@@ -1446,6 +1497,27 @@ def run_fundamental_engine(database):
             "MOTOR_ALTERNATIVO",
         ],
         default="SEM_MOTOR"
+    )
+
+
+    # ========================================================
+    # QUALIDADE DO VALUATION
+    # ========================================================
+
+    base[
+        "valuation_disponivel"
+    ] = base[
+        "pvp"
+    ].notna()
+
+    base[
+        "status_valuation"
+    ] = np.where(
+        base[
+            "valuation_disponivel"
+        ],
+        "PVP_DISPONIVEL",
+        "PVP_AUSENTE"
     )
 
 
@@ -1499,6 +1571,32 @@ def run_fundamental_engine(database):
         mask_special,
         "status_fundamental"
     ] = "MOTOR ESPECIAL NECESSÁRIO"
+
+    # Fundo sem P/VP pode continuar no universo, mas a aprovação
+    # depende do score já reduzido e da confiança de dados.
+    mask_pvp_missing = (
+        base[
+            "pvp"
+        ].isna()
+        &
+        ~mask_special
+    )
+
+    base.loc[
+        mask_pvp_missing
+        &
+        (
+            base[
+                "status_fundamental"
+            ].isin(
+                [
+                    "ELITE",
+                    "PREMIUM",
+                ]
+            )
+        ),
+        "status_fundamental"
+    ] = "MUITO FORTE — VALUATION PENDENTE"
 
 
     # ========================================================
@@ -1617,6 +1715,18 @@ def run_fundamental_engine(database):
 
 
     print()
+    print(
+        "P/VP disponível            : "
+        f"{int(base['valuation_disponivel'].sum())}/"
+        f"{len(base)}"
+    )
+
+    print(
+        "P/VP ausente               : "
+        f"{int((~base['valuation_disponivel']).sum())}"
+    )
+
+    print()
     print("=" * 100)
     print("TOP 15 FUNDAMENTALISTA")
     print("=" * 100)
@@ -1641,6 +1751,12 @@ def run_fundamental_engine(database):
         "dy_12m",
 
         "pvp",
+
+        "status_valuation",
+
+        "confianca_dados",
+
+        "penalidade_qualidade_dados",
 
         "pilar_renda",
 
