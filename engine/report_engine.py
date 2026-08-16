@@ -39,7 +39,7 @@ from config import (
 def _fmt_pct(value, decimals=2):
 
     try:
-        return f"{float(value):.{decimals}%"
+        return f"{float(value):.{decimals}%}"
     except Exception:
         return "-"
 
@@ -47,7 +47,7 @@ def _fmt_pct(value, decimals=2):
 def _fmt_num(value, decimals=1):
 
     try:
-        return f"{float(value):.{decimals}f"
+        return f"{float(value):.{decimals}f}"
     except Exception:
         return "-"
 
