@@ -3,6 +3,7 @@
 # engine/portfolio_engine.py
 # ============================================================
 
+from pathlib import Path
 import warnings
 
 import numpy as np
@@ -13,6 +14,7 @@ from scipy.optimize import minimize
 from sklearn.covariance import LedoitWolf
 
 from config import (
+    DATA_DIR,
     FUNDAMENTAL_WEIGHT,
     TECHNICAL_WEIGHT,
     INSTITUTIONAL_ELITE,
@@ -625,88 +627,151 @@ def _download_portfolio_prices(tickers):
 
     series = []
 
+    clean_dir = (
+        Path(DATA_DIR)
+        / "history_clean"
+    )
 
     for ticker in tickers:
 
-        symbol = f"{ticker}.SA"
+        close = None
 
-        try:
+        # ====================================================
+        # FONTE PRINCIPAL — HISTÓRICO LIMPO DO DATA ENGINE
+        # ====================================================
 
-            hist = yf.download(
+        clean_file = (
+            clean_dir
+            /
+            f"{ticker}.csv"
+        )
 
-                symbol,
+        if clean_file.exists():
 
-                period="3y",
+            try:
 
-                interval="1d",
+                hist = pd.read_csv(
+                    clean_file,
+                    index_col=0,
+                    parse_dates=True,
+                )
 
-                auto_adjust=YAHOO_AUTO_ADJUST,
+                if (
+                    hist is not None
+                    and not hist.empty
+                    and "Close" in hist.columns
+                ):
 
-                repair=YAHOO_REPAIR,
+                    hist.index = pd.to_datetime(
+                        hist.index,
+                        errors="coerce"
+                    )
 
-                progress=False,
-
-                threads=False,
-
-            )
-
-        except Exception:
-
-            continue
-
-
-        if hist is None or hist.empty:
-
-            continue
-
-
-        if isinstance(
-            hist.columns,
-            pd.MultiIndex
-        ):
-
-            if "Close" in hist.columns.get_level_values(0):
-
-                close = (
-
-                    hist[
-                        "Close"
+                    hist = hist[
+                        ~hist.index.isna()
                     ]
 
-                    .iloc[:, 0]
+                    hist = hist[
+                        ~hist.index.duplicated(
+                            keep="last"
+                        )
+                    ]
 
+                    hist = hist.sort_index()
+
+                    close = pd.to_numeric(
+                        hist[
+                            "Close"
+                        ],
+                        errors="coerce"
+                    )
+
+            except Exception as exc:
+
+                print(
+                    f"[AVISO] {ticker} | "
+                    f"falha ao ler history_clean: {exc}"
                 )
+
+                close = None
+
+
+        # ====================================================
+        # FALLBACK — YAHOO
+        # ====================================================
+
+        if (
+            close is None
+            or close.dropna().empty
+        ):
+
+            symbol = f"{ticker}.SA"
+
+            try:
+
+                hist = yf.download(
+                    symbol,
+                    period="3y",
+                    interval="1d",
+                    auto_adjust=YAHOO_AUTO_ADJUST,
+                    repair=YAHOO_REPAIR,
+                    progress=False,
+                    threads=False,
+                )
+
+            except Exception as exc:
+
+                print(
+                    f"[AVISO] {ticker} | "
+                    f"fallback Yahoo falhou: {exc}"
+                )
+
+                continue
+
+            if hist is None or hist.empty:
+                continue
+
+            if isinstance(
+                hist.columns,
+                pd.MultiIndex
+            ):
+
+                if (
+                    "Close"
+                    in
+                    hist.columns.get_level_values(0)
+                ):
+
+                    close = (
+                        hist[
+                            "Close"
+                        ]
+                        .iloc[:, 0]
+                    )
+
+                else:
+                    continue
 
             else:
 
-                continue
+                if "Close" not in hist.columns:
+                    continue
 
-        else:
-
-            if "Close" not in hist.columns:
-
-                continue
-
-            close = hist[
-                "Close"
-            ]
+                close = hist[
+                    "Close"
+                ]
 
 
         close = (
-
             pd.to_numeric(
                 close,
                 errors="coerce"
             )
-
             .dropna()
-
             .rename(
                 ticker
             )
-
         )
-
 
         if not close.empty:
 
@@ -718,58 +783,67 @@ def _download_portfolio_prices(tickers):
     if not series:
 
         raise RuntimeError(
-            "Não foi possível coletar preços da carteira."
+            "Não foi possível obter histórico "
+            "de preços para a carteira."
         )
 
 
     prices = pd.concat(
-
         series,
-
         axis=1,
-
         join="outer"
-
     )
 
-
     prices = (
-
         prices
-
         .sort_index()
-
         .ffill(
             limit=3
         )
-
-        .dropna(
-            how="any"
-        )
-
     )
 
 
-    missing = set(
-        tickers
-    ) - set(
-        prices.columns
+    missing = sorted(
+        set(tickers)
+        -
+        set(prices.columns)
     )
-
 
     if missing:
 
         raise RuntimeError(
-            "Sem histórico suficiente para: "
-            + ", ".join(
-                sorted(missing)
+            "Sem histórico para: "
+            +
+            ", ".join(
+                missing
             )
         )
 
 
-    return prices[
-        tickers
-    ]
+    prices = (
+        prices[
+            tickers
+        ]
+        .dropna(
+            how="any"
+        )
+    )
+
+    if len(prices) < 100:
+
+        raise RuntimeError(
+            "Histórico comum insuficiente para "
+            f"matriz de risco: {len(prices)} pregões."
+        )
+
+
+    print(
+        f"Histórico de risco carregado: "
+        f"{len(prices)} pregões comuns "
+        f"para {len(tickers)} FIIs."
+    )
+
+    return prices
 
 
 # ============================================================
@@ -859,16 +933,30 @@ def _build_covariance(
         )
 
 
-    lw = LedoitWolf()
+    try:
 
-    lw.fit(
-        sample.values
-    )
+        lw = LedoitWolf()
 
+        lw.fit(
+            sample.values
+        )
 
-    cov_daily = (
-        lw.covariance_
-    )
+        cov_daily = (
+            lw.covariance_
+        )
+
+    except Exception as exc:
+
+        print(
+            "[AVISO] LedoitWolf falhou; "
+            f"usando covariância amostral: {exc}"
+        )
+
+        cov_daily = np.cov(
+            sample.values,
+            rowvar=False,
+            ddof=1
+        )
 
 
     cov_annual = (
@@ -1078,31 +1166,23 @@ def _optimize_portfolio(
     def objective(w):
 
         variance = (
-
             w
             @
             cov_annual
             @
             w
-
         )
-
 
         hhi = np.sum(
             w ** 2
         )
 
-
         return (
-
             variance
-
             +
-
             HHI_PENALTY
             *
             hhi
-
         )
 
 
@@ -1118,9 +1198,6 @@ def _optimize_portfolio(
                 lambda w:
                     np.sum(w) - 1
         },
-
-
-        # PAPEL
 
         {
             "type": "ineq",
@@ -1146,9 +1223,6 @@ def _optimize_portfolio(
                     )
         },
 
-
-        # TIJOLO
-
         {
             "type": "ineq",
             "fun":
@@ -1173,9 +1247,6 @@ def _optimize_portfolio(
                     )
         },
 
-
-        # ALTERNATIVO
-
         {
             "type": "ineq",
             "fun":
@@ -1187,9 +1258,6 @@ def _optimize_portfolio(
                         masks["alternative"]
                     )
         },
-
-
-        # HIGH YIELD
 
         {
             "type": "ineq",
@@ -1203,9 +1271,6 @@ def _optimize_portfolio(
                     )
         },
 
-
-        # LOGÍSTICA
-
         {
             "type": "ineq",
             "fun":
@@ -1217,9 +1282,6 @@ def _optimize_portfolio(
                         masks["logistics"]
                     )
         },
-
-
-        # SHOPPING
 
         {
             "type": "ineq",
@@ -1233,9 +1295,6 @@ def _optimize_portfolio(
                     )
         },
 
-
-        # RENDA URBANA
-
         {
             "type": "ineq",
             "fun":
@@ -1247,9 +1306,6 @@ def _optimize_portfolio(
                         masks["urban_income"]
                     )
         },
-
-
-        # LAJES
 
         {
             "type": "ineq",
@@ -1263,9 +1319,6 @@ def _optimize_portfolio(
                     )
         },
 
-
-        # FUNDAMENTAL
-
         {
             "type": "ineq",
             "fun":
@@ -1276,9 +1329,6 @@ def _optimize_portfolio(
                     -
                     min_fund
         },
-
-
-        # INSTITUTIONAL
 
         {
             "type": "ineq",
@@ -1308,11 +1358,167 @@ def _optimize_portfolio(
     ]
 
 
+    # ========================================================
+    # AUXILIAR — VIOLAÇÕES
+    # ========================================================
+
+    def constraint_violations(w):
+
+        values = []
+
+        for c in constraints:
+
+            value = float(
+                c["fun"](w)
+            )
+
+            if c["type"] == "eq":
+
+                values.append(
+                    abs(value)
+                )
+
+            else:
+
+                values.append(
+                    max(
+                        0.0,
+                        -value
+                    )
+                )
+
+        return np.asarray(
+            values,
+            dtype=float
+        )
+
+
+    def feasibility_objective(w):
+
+        v = constraint_violations(
+            w
+        )
+
+        return float(
+            np.sum(
+                v ** 2
+            )
+        )
+
+
+    # ========================================================
+    # ETAPA 1 — ENCONTRAR PONTO VIÁVEL
+    # ========================================================
+
+    starts = []
+
+    starts.append(
+        _normalize_weights(
+            np.clip(
+                w0,
+                MIN_WEIGHT,
+                MAX_WEIGHT
+            )
+        )
+    )
+
+    uniform = np.full(
+        len(portfolio),
+        1.0 / len(portfolio)
+    )
+
+    uniform = _normalize_weights(
+        np.clip(
+            uniform,
+            MIN_WEIGHT,
+            MAX_WEIGHT
+        )
+    )
+
+    starts.append(
+        uniform
+    )
+
+
+    best_feasible = None
+    best_violation = np.inf
+
+    for start in starts:
+
+        feasible_result = minimize(
+
+            feasibility_objective,
+
+            start,
+
+            method="SLSQP",
+
+            bounds=bounds,
+
+            constraints=[
+                {
+                    "type": "eq",
+                    "fun":
+                        lambda w:
+                            np.sum(w) - 1
+                }
+            ],
+
+            options={
+                "maxiter": 2500,
+                "ftol": 1e-12,
+                "disp": False,
+            },
+
+        )
+
+        candidate = _normalize_weights(
+            feasible_result.x
+        )
+
+        violation = float(
+            np.max(
+                constraint_violations(
+                    candidate
+                )
+            )
+        )
+
+        if violation < best_violation:
+
+            best_violation = violation
+            best_feasible = candidate
+
+
+    if (
+        best_feasible is None
+        or best_violation > 1e-5
+    ):
+
+        print(
+            "[AVISO] Restrições da carteira "
+            "não possuem ponto plenamente viável. "
+            f"Violação mínima={best_violation:.8f}"
+        )
+
+        # Não derruba o scanner. Mantém o melhor ponto
+        # encontrado e registra a condição no diagnóstico.
+        best_feasible = (
+            best_feasible
+            if best_feasible is not None
+            else starts[0]
+        )
+
+
+    # ========================================================
+    # ETAPA 2 — OTIMIZAÇÃO PRINCIPAL
+    # ========================================================
+
     result = minimize(
 
         objective,
 
-        w0,
+        best_feasible,
 
         method="SLSQP",
 
@@ -1321,36 +1527,90 @@ def _optimize_portfolio(
         constraints=constraints,
 
         options={
-
-            "maxiter":
-                3000,
-
-            "ftol":
-                1e-12,
-
-            "disp":
-                False,
-
+            "maxiter": 5000,
+            "ftol": 1e-10,
+            "disp": False,
         },
 
     )
 
 
-    if not result.success:
+    # ========================================================
+    # ETAPA 3 — FALLBACK CONTROLADO
+    # ========================================================
 
-        raise RuntimeError(
-            "Otimização não convergiu: "
-            + result.message
+    if result.success:
+
+        weights = _normalize_weights(
+            result.x
+        )
+
+        return (
+            weights,
+            result,
+            masks
         )
 
 
-    weights = _normalize_weights(
-        result.x
+    print(
+        "[AVISO] Otimização principal não convergiu: "
+        f"{result.message}"
     )
 
 
+    candidate = _normalize_weights(
+        result.x
+    )
+
+    candidate_violation = float(
+        np.max(
+            constraint_violations(
+                candidate
+            )
+        )
+    )
+
+
+    if candidate_violation <= 1e-4:
+
+        print(
+            "[FALLBACK] Solução do SLSQP é "
+            "numericamente aceitável apesar do status."
+        )
+
+        result.x = candidate
+
+        result.message = (
+            "SLSQP sem flag de sucesso, "
+            "mas solução dentro da tolerância."
+        )
+
+        return (
+            candidate,
+            result,
+            masks
+        )
+
+
+    # Último fallback: usa o melhor ponto de viabilidade.
+    # O scanner continua, mas deixa explícito que não houve
+    # otimização de risco válida.
+    print(
+        "[FALLBACK] Usando melhor carteira viável encontrada. "
+        f"Violação máxima={best_violation:.8f}"
+    )
+
+    result.x = best_feasible
+
+    result.success = False
+
+    result.message = (
+        "Fallback para melhor ponto viável; "
+        f"otimizador não convergiu ({result.message})."
+    )
+
     return (
-        weights,
+        best_feasible,
         result,
         masks
     )
@@ -1746,8 +2006,16 @@ def build_portfolio(
     # RISCO
     # ========================================================
 
+    print(
+        "Carregando histórico de risco..."
+    )
+
     prices = _download_portfolio_prices(
         tickers
+    )
+
+    print(
+        "Histórico de risco OK."
     )
 
 
@@ -1764,6 +2032,10 @@ def build_portfolio(
         robust_returns
     )
 
+    print(
+        "Matriz de covariância OK."
+    )
+
 
     # ========================================================
     # PESOS INICIAIS
@@ -1777,6 +2049,10 @@ def build_portfolio(
     # ========================================================
     # OTIMIZAÇÃO
     # ========================================================
+
+    print(
+        "Otimizando pesos..."
+    )
 
     weights, optimization_result, masks = (
 
