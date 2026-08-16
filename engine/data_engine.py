@@ -1,9 +1,10 @@
 # ============================================================
 # FII INSTITUTIONAL SCANNER
-# engine/technical_engine.py
+# engine/data_engine.py
 # ============================================================
 
 from pathlib import Path
+import time
 import warnings
 
 import numpy as np
@@ -13,134 +14,417 @@ from tqdm import tqdm
 
 from config import (
     DATA_DIR,
-    RSI_WINDOW,
-    SMA_SHORT,
-    SMA_MEDIUM,
-    SMA_LONG,
-    VOLUME_WINDOW,
-    RETURN_1M_DAYS,
-    RETURN_3M_DAYS,
-    RETURN_6M_DAYS,
-    HIGH_52W_WINDOW,
-    TECHNICAL_STRONG,
-    TECHNICAL_ACCEPTABLE,
-    RSI_OVERBOUGHT,
-    MAX_DISTANCE_SMA200,
+    UNIVERSE_FILE,
+    PRICE_HISTORY,
     YAHOO_REPAIR,
     YAHOO_AUTO_ADJUST,
+    MIN_PRICE_OBSERVATIONS,
+    MIN_LIQUIDITY,
+    LIQUIDITY_WINDOW,
+    RULE_ZERO_MIN_HISTORY,
+    RULE_ZERO_REQUIRE_PRICE,
+    RULE_ZERO_REQUIRE_LIQUIDITY,
+    RULE_ZERO_REQUIRE_CATEGORY,
+    EXTREME_RETURN_ALERT,
+    SAVE_UNIVERSE,
 )
 
 warnings.filterwarnings("ignore")
 
 
 # ============================================================
-# 1. AUXILIARES
+# HIGIENE DE SÉRIE / EVENTOS ESTRUTURAIS
+# ============================================================
+#
+# Objetivo:
+# - detectar saltos incompatíveis com movimento normal de mercado;
+# - diferenciar um evento estrutural persistente de uma oscilação real;
+# - retroajustar o histórico anterior ao evento, preservando o nível atual;
+# - nunca "apagar" silenciosamente retornos normais.
+#
+STRUCTURAL_JUMP_MIN = 0.50
+STRUCTURAL_WINDOW = 5
+STRUCTURAL_FACTOR_TOLERANCE = 0.20
+
+HISTORY_CLEAN_DIR = Path(DATA_DIR) / "history_clean"
+
+
+# ============================================================
+# UNIVERSO INICIAL
 # ============================================================
 
-def clip_score(value):
+# Universo utilizado no estudo original.
+# Podemos ampliar posteriormente sem alterar o restante
+# da arquitetura.
 
-    if pd.isna(value):
-        return np.nan
+FII_UNIVERSE = {
 
-    return float(
-        np.clip(
-            value,
-            0,
-            100
-        )
-    )
+    # --------------------------------------------------------
+    # PAPEL
+    # --------------------------------------------------------
+
+    "KNCR11": ("PAPEL", "CRI_CDI"),
+    "MXRF11": ("PAPEL", "MULTIESTRATEGIA_CREDITO"),
+    "KNSC11": ("PAPEL", "CRI"),
+    "KNIP11": ("PAPEL", "CRI_IPCA"),
+    "VRTA11": ("PAPEL", "CRI"),
+    "KNHY11": ("PAPEL", "CRI_HIGH_YIELD"),
+    "XPCI11": ("PAPEL", "CRI"),
+    "KCRE11": ("PAPEL", "CRI"),
+    "RZAK11": ("PAPEL", "CRI_HIGH_YIELD"),
+    "BCRI11": ("PAPEL", "CRI"),
+    "OUJP11": ("PAPEL", "CRI"),
+    "DEVA11": ("PAPEL", "CRI_HIGH_YIELD"),
+    "HCTR11": ("PAPEL", "CRI_HIGH_YIELD"),
+    "URPR11": ("PAPEL", "CRI_HIGH_YIELD"),
+
+    # --------------------------------------------------------
+    # TIJOLO
+    # --------------------------------------------------------
+
+    "XPLG11": ("TIJOLO", "LOGISTICA"),
+    "HGLG11": ("TIJOLO", "LOGISTICA"),
+    "XPML11": ("TIJOLO", "SHOPPING"),
+    "HGRU11": ("TIJOLO", "RENDA_URBANA"),
+    "HGBS11": ("TIJOLO", "SHOPPING"),
+    "ALZR11": ("TIJOLO", "RENDA_URBANA"),
+    "GTWR11": ("TIJOLO", "LAJES"),
+    "HSML11": ("TIJOLO", "SHOPPING"),
+    "SNEL11": ("TIJOLO", "ENERGIA_RENOVAVEL"),
+    "LVBI11": ("TIJOLO", "LOGISTICA"),
+    "VISC11": ("TIJOLO", "SHOPPING"),
+    "BRCO11": ("TIJOLO", "LOGISTICA"),
+    "VILG11": ("TIJOLO", "LOGISTICA"),
+    "JSRE11": ("TIJOLO", "LAJES"),
+    "HSLG11": ("TIJOLO", "LOGISTICA"),
+    "RCRB11": ("TIJOLO", "LAJES"),
+    "TRXF11": ("TIJOLO", "RENDA_URBANA"),
+
+    # --------------------------------------------------------
+    # ALTERNATIVOS
+    # --------------------------------------------------------
+
+    "KNRI11": ("ALTERNATIVO", "TIJOLO_DIVERSIFICADO"),
+    "VGHF11": ("ALTERNATIVO", "MULTIESTRATEGIA"),
+    "KFOF11": ("ALTERNATIVO", "FOF"),
+    "JSAF11": ("ALTERNATIVO", "FOF"),
+    "TGAR11": ("ALTERNATIVO", "DESENVOLVIMENTO"),
+}
 
 
-def safe_div(a, b):
+# ============================================================
+# FUNÇÕES AUXILIARES
+# ============================================================
+
+def _safe_float(value, default=np.nan):
 
     try:
 
-        if b == 0:
-            return np.nan
+        value = float(value)
 
-        return a / b
+        if np.isfinite(value):
+            return value
 
-    except Exception:
-        return np.nan
+    except (TypeError, ValueError):
+        pass
+
+    return default
 
 
-# ============================================================
-# 2. RSI
-# ============================================================
+def _normalize_columns(df):
 
-def calculate_rsi(series, window=14):
+    if isinstance(df.columns, pd.MultiIndex):
 
-    delta = series.diff()
+        # Para download individual normalmente o primeiro
+        # nível contém Open/High/Low/Close/Volume.
 
-    gain = delta.clip(
-        lower=0
+        if "Close" in df.columns.get_level_values(0):
+
+            df.columns = df.columns.get_level_values(0)
+
+        else:
+
+            df.columns = [
+                "_".join(
+                    [
+                        str(x)
+                        for x in col
+                        if str(x) != ""
+                    ]
+                )
+                for col in df.columns
+            ]
+
+    return df
+
+
+def _detect_structural_events(df):
+
+    events = []
+
+    if df is None or df.empty:
+        return events
+
+    if "Close" not in df.columns:
+        return events
+
+    close = pd.to_numeric(
+        df["Close"],
+        errors="coerce"
     )
 
-    loss = (
-        -delta.clip(
-            upper=0
+    valid = close.dropna()
+
+    if len(valid) < (
+        STRUCTURAL_WINDOW * 2 + 2
+    ):
+        return events
+
+    returns = (
+        valid
+        .pct_change(fill_method=None)
+    )
+
+    candidate_dates = returns[
+        returns.abs() >= STRUCTURAL_JUMP_MIN
+    ].index
+
+    for event_date in candidate_dates:
+
+        loc = valid.index.get_loc(
+            event_date
         )
-    )
 
-    avg_gain = gain.rolling(
-        window
-    ).mean()
+        if isinstance(loc, slice):
+            continue
 
-    avg_loss = loss.rolling(
-        window
-    ).mean()
+        if loc < STRUCTURAL_WINDOW:
+            continue
 
-    rs = (
-        avg_gain
-        /
-        avg_loss.replace(
-            0,
-            np.nan
+        if (
+            loc + STRUCTURAL_WINDOW
+            >= len(valid)
+        ):
+            continue
+
+        before = valid.iloc[
+            loc - STRUCTURAL_WINDOW:
+            loc
+        ]
+
+        after = valid.iloc[
+            loc:
+            loc + STRUCTURAL_WINDOW
+        ]
+
+        if before.empty or after.empty:
+            continue
+
+        before_med = float(
+            before.median()
         )
-    )
 
-    rsi = (
-        100
-        -
-        (
-            100
+        after_med = float(
+            after.median()
+        )
+
+        if (
+            before_med <= 0
+            or after_med <= 0
+        ):
+            continue
+
+        factor = (
+            after_med
             /
-            (
-                1 + rs
-            )
+            before_med
         )
+
+        jump_factor = (
+            valid.iloc[loc]
+            /
+            valid.iloc[loc - 1]
+        )
+
+        # Um evento estrutural verdadeiro tende a criar um
+        # novo patamar persistente. Ex.: grupamento/desdobramento
+        # ou erro de escala na origem de dados.
+        persistence_error = abs(
+            factor - jump_factor
+        ) / max(
+            abs(jump_factor),
+            1e-12
+        )
+
+        if (
+            persistence_error
+            <= STRUCTURAL_FACTOR_TOLERANCE
+            and (
+                factor >= 1.50
+                or factor <= (1 / 1.50)
+            )
+        ):
+
+            events.append(
+                {
+                    "date": event_date,
+                    "factor": float(factor),
+                    "jump_return": float(
+                        returns.loc[event_date]
+                    ),
+                    "persistence_error": float(
+                        persistence_error
+                    ),
+                }
+            )
+
+    return events
+
+
+def _repair_structural_events(ticker, df):
+
+    if df is None or df.empty:
+        return df, []
+
+    clean = df.copy()
+
+    events = _detect_structural_events(
+        clean
     )
 
-    return rsi
+    if not events:
+        return clean, []
+
+    # Aplicamos em ordem cronológica.
+    events = sorted(
+        events,
+        key=lambda x: x["date"]
+    )
+
+    price_columns = [
+        col
+        for col in [
+            "Open",
+            "High",
+            "Low",
+            "Close",
+        ]
+        if col in clean.columns
+    ]
+
+    adjusted_events = []
+
+    for event in events:
+
+        event_date = event["date"]
+        factor = event["factor"]
+
+        if (
+            not np.isfinite(factor)
+            or factor <= 0
+        ):
+            continue
+
+        mask_prior = (
+            clean.index
+            <
+            event_date
+        )
+
+        if not mask_prior.any():
+            continue
+
+        # Retroajuste: traz o histórico antigo para a mesma
+        # escala do patamar posterior, preservando o preço atual.
+        clean.loc[
+            mask_prior,
+            price_columns
+        ] = (
+            clean.loc[
+                mask_prior,
+                price_columns
+            ]
+            * factor
+        )
+
+        adjusted_events.append(
+            event
+        )
+
+        print(
+            f"[EVENTO ESTRUTURAL] {ticker} | "
+            f"{pd.Timestamp(event_date).date()} | "
+            f"retorno bruto={event['jump_return']:+.2%} | "
+            f"fator={factor:.4f} | "
+            f"histórico anterior retroajustado."
+        )
+
+    return clean, adjusted_events
 
 
-# ============================================================
-# 3. DOWNLOAD
-# ============================================================
+def _save_clean_history(ticker, history):
+
+    if history is None or history.empty:
+        return
+
+    HISTORY_CLEAN_DIR.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    output = (
+        HISTORY_CLEAN_DIR
+        /
+        f"{ticker}.csv"
+    )
+
+    history.to_csv(
+        output,
+        encoding="utf-8-sig"
+    )
+
 
 def _download_history(ticker):
 
-    # ========================================================
-    # FONTE PRINCIPAL — HISTÓRICO HIGIENIZADO PELO DATA ENGINE
-    # ========================================================
+    yahoo_ticker = f"{ticker}.SA"
 
-    clean_file = (
-        Path(DATA_DIR)
-        / "history_clean"
-        / f"{ticker}.csv"
-    )
+    # ========================================================
+    # POLÍTICA DE RETRY
+    # ========================================================
+    #
+    # Objetivo:
+    # - evitar que um rate limit temporário elimine um FII;
+    # - não inventar dados;
+    # - tentar duas rotas do Yahoo;
+    # - manter o pipeline enxuto.
+    #
+    # Estratégia:
+    # 1. yf.download com configuração principal;
+    # 2. repetir com espera progressiva;
+    # 3. fallback via Ticker.history;
+    # 4. última tentativa sem repair.
+    #
+    max_attempts = 3
 
-    if clean_file.exists():
+    for attempt in range(1, max_attempts + 1):
 
         try:
 
-            df = pd.read_csv(
-                clean_file,
-                index_col=0,
-                parse_dates=True,
+            df = yf.download(
+                yahoo_ticker,
+                period=PRICE_HISTORY,
+                interval="1d",
+                auto_adjust=YAHOO_AUTO_ADJUST,
+                repair=YAHOO_REPAIR,
+                progress=False,
+                threads=False,
             )
 
             if df is not None and not df.empty:
+
+                df = _normalize_columns(
+                    df.copy()
+                )
 
                 df.index = pd.to_datetime(
                     df.index,
@@ -159,7 +443,30 @@ def _download_history(ticker):
 
                 df = df.sort_index()
 
-                if "Close" in df.columns:
+                if not df.empty:
+
+                    if attempt > 1:
+
+                        print(
+                            f"[RECUPERADO] {ticker} "
+                            f"na tentativa {attempt}."
+                        )
+
+                    df, structural_events = (
+                        _repair_structural_events(
+                            ticker,
+                            df
+                        )
+                    )
+
+                    df.attrs[
+                        "structural_events"
+                    ] = structural_events
+
+                    _save_clean_history(
+                        ticker,
+                        df
+                    )
 
                     return df
 
@@ -167,967 +474,733 @@ def _download_history(ticker):
 
             print(
                 f"[AVISO] {ticker} | "
-                f"falha ao carregar histórico limpo: {exc}"
+                f"tentativa {attempt}/{max_attempts} "
+                f"falhou: {exc}"
             )
 
-    # ========================================================
-    # FALLBACK — YAHOO
-    # ========================================================
 
-    symbol = f"{ticker}.SA"
+        # ----------------------------------------------------
+        # FALLBACK VIA Ticker.history
+        # ----------------------------------------------------
+
+        try:
+
+            tk = yf.Ticker(
+                yahoo_ticker
+            )
+
+            df_alt = tk.history(
+                period=PRICE_HISTORY,
+                interval="1d",
+                auto_adjust=YAHOO_AUTO_ADJUST,
+                repair=YAHOO_REPAIR,
+                actions=False,
+            )
+
+            if df_alt is not None and not df_alt.empty:
+
+                df_alt = _normalize_columns(
+                    df_alt.copy()
+                )
+
+                df_alt.index = pd.to_datetime(
+                    df_alt.index,
+                    errors="coerce"
+                )
+
+                df_alt = df_alt[
+                    ~df_alt.index.isna()
+                ]
+
+                df_alt = df_alt[
+                    ~df_alt.index.duplicated(
+                        keep="last"
+                    )
+                ]
+
+                df_alt = df_alt.sort_index()
+
+                if not df_alt.empty:
+
+                    print(
+                        f"[RECUPERADO] {ticker} "
+                        f"via Ticker.history."
+                    )
+
+                    df_alt, structural_events = (
+                        _repair_structural_events(
+                            ticker,
+                            df_alt
+                        )
+                    )
+
+                    df_alt.attrs[
+                        "structural_events"
+                    ] = structural_events
+
+                    _save_clean_history(
+                        ticker,
+                        df_alt
+                    )
+
+                    return df_alt
+
+        except Exception as exc:
+
+            print(
+                f"[AVISO] {ticker} | "
+                f"fallback history falhou: {exc}"
+            )
+
+
+        # ----------------------------------------------------
+        # ESPERA PROGRESSIVA
+        # ----------------------------------------------------
+
+        if attempt < max_attempts:
+
+            wait_seconds = (
+                2 ** (attempt - 1)
+            )
+
+            print(
+                f"[RETRY] {ticker} em "
+                f"{wait_seconds}s..."
+            )
+
+            time.sleep(
+                wait_seconds
+            )
+
+
+    # ========================================================
+    # ÚLTIMA TENTATIVA — SEM REPAIR
+    # ========================================================
 
     try:
 
         df = yf.download(
-            symbol,
-            period="2y",
+            yahoo_ticker,
+            period=PRICE_HISTORY,
             interval="1d",
             auto_adjust=YAHOO_AUTO_ADJUST,
-            repair=YAHOO_REPAIR,
+            repair=False,
             progress=False,
             threads=False,
         )
 
-    except Exception:
+        if df is not None and not df.empty:
 
-        return pd.DataFrame()
-
-    if df is None or df.empty:
-
-        return pd.DataFrame()
-
-    if isinstance(
-        df.columns,
-        pd.MultiIndex
-    ):
-
-        if "Close" in df.columns.get_level_values(0):
-
-            df.columns = (
-                df.columns
-                .get_level_values(0)
+            df = _normalize_columns(
+                df.copy()
             )
 
-    df.index = pd.to_datetime(
-        df.index,
-        errors="coerce"
+            df.index = pd.to_datetime(
+                df.index,
+                errors="coerce"
+            )
+
+            df = df[
+                ~df.index.isna()
+            ]
+
+            df = df[
+                ~df.index.duplicated(
+                    keep="last"
+                )
+            ]
+
+            df = df.sort_index()
+
+            if not df.empty:
+
+                print(
+                    f"[RECUPERADO] {ticker} "
+                    f"na última tentativa sem repair."
+                )
+
+                df, structural_events = (
+                    _repair_structural_events(
+                        ticker,
+                        df
+                    )
+                )
+
+                df.attrs[
+                    "structural_events"
+                ] = structural_events
+
+                _save_clean_history(
+                    ticker,
+                    df
+                )
+
+                return df
+
+    except Exception as exc:
+
+        print(
+            f"[AVISO] {ticker} | "
+            f"última tentativa falhou: {exc}"
+        )
+
+
+    # ========================================================
+    # FALHA DEFINITIVA
+    # ========================================================
+
+    print(
+        f"[FALHA DE DADOS] {ticker} não foi "
+        f"coletado após todas as tentativas. "
+        f"O ativo não será considerado aprovado "
+        f"pela Regra Zero nesta execução."
     )
 
-    df = df[
-        ~df.index.isna()
-    ]
-
-    df = df[
-        ~df.index.duplicated(
-            keep="last"
-        )
-    ]
-
-    df = df.sort_index()
-
-    return df
+    return pd.DataFrame()
 
 
 # ============================================================
-# 4. INDICADORES
+# MÉTRICAS DE MERCADO
 # ============================================================
 
-def _calculate_indicators(ticker):
+def _calculate_market_metrics(ticker, history):
 
     result = {
 
         "ticker": ticker,
 
-        "preco_tecnico": np.nan,
+        "preco": np.nan,
 
-        "rsi14": np.nan,
+        "observacoes_preco": 0,
 
-        "retorno_1m": np.nan,
+        "liquidez_media_60d": np.nan,
 
-        "retorno_3m": np.nan,
+        "volatilidade_anual": np.nan,
 
-        "retorno_6m": np.nan,
+        "drawdown_5a": np.nan,
 
-        "dist_sma20": np.nan,
+        "maior_retorno_abs": np.nan,
 
-        "dist_sma50": np.nan,
+        "eventos_extremos": 0,
 
-        "dist_sma200": np.nan,
+        "eventos_estruturais_detectados": 0,
 
-        "distancia_max_52s": np.nan,
+        "dados_preco_ok": False,
 
-        "volume_relativo": np.nan,
-
-        "score_tendencia": np.nan,
-
-        "penalidade_estiramento": 0.0,
-
-        "technical_score": np.nan,
-
-        "classificacao_tecnica": "SEM DADO",
-
-        "status_timing": "AGUARDAR CONFIRMAÇÃO",
-
-        "fonte_historico_tecnico": "DESCONHECIDA",
+        "status_coleta": "SEM_DADOS",
     }
 
-    hist = _download_history(
-        ticker
-    )
+    if history.empty:
+        return result
 
-    clean_file = (
-        Path(DATA_DIR)
-        / "history_clean"
-        / f"{ticker}.csv"
+    if "Close" not in history.columns:
+        return result
+
+    structural_events = history.attrs.get(
+        "structural_events",
+        []
     )
 
     result[
-        "fonte_historico_tecnico"
-    ] = (
-        "HISTORY_CLEAN"
-        if clean_file.exists()
-        else "YAHOO_FALLBACK"
+        "eventos_estruturais_detectados"
+    ] = len(
+        structural_events
     )
 
-    if hist.empty:
-
-        return result
-
-    if "Close" not in hist.columns:
-
-        return result
-
     close = pd.to_numeric(
-        hist["Close"],
+        history["Close"],
         errors="coerce"
     ).dropna()
 
-    if len(close) < SMA_LONG:
-
+    if close.empty:
         return result
 
-    preco = float(
+    close = close[
+        close > 0
+    ]
+
+    if close.empty:
+        return result
+
+    result["preco"] = _safe_float(
         close.iloc[-1]
     )
 
-    result[
-        "preco_tecnico"
-    ] = preco
-
-
-    # ========================================================
-    # RSI
-    # ========================================================
-
-    rsi = calculate_rsi(
-        close,
-        RSI_WINDOW
+    result["observacoes_preco"] = len(
+        close
     )
 
-    if not rsi.dropna().empty:
+    result["dados_preco_ok"] = (
+        len(close) >= MIN_PRICE_OBSERVATIONS
+    )
 
-        result[
-            "rsi14"
-        ] = float(
-            rsi.dropna().iloc[-1]
-        )
+    result["status_coleta"] = "OK"
 
 
-    # ========================================================
+    # --------------------------------------------------------
     # RETORNOS
-    # ========================================================
+    # --------------------------------------------------------
 
-    if len(close) > RETURN_1M_DAYS:
-
-        result[
-            "retorno_1m"
-        ] = (
-            preco
-            /
-            close.iloc[
-                -RETURN_1M_DAYS - 1
-            ]
-            - 1
-        )
-
-
-    if len(close) > RETURN_3M_DAYS:
-
-        result[
-            "retorno_3m"
-        ] = (
-            preco
-            /
-            close.iloc[
-                -RETURN_3M_DAYS - 1
-            ]
-            - 1
-        )
-
-
-    if len(close) > RETURN_6M_DAYS:
-
-        result[
-            "retorno_6m"
-        ] = (
-            preco
-            /
-            close.iloc[
-                -RETURN_6M_DAYS - 1
-            ]
-            - 1
-        )
-
-
-    # ========================================================
-    # MÉDIAS
-    # ========================================================
-
-    sma20 = (
+    returns = (
         close
-        .rolling(
-            SMA_SHORT
+        .pct_change(fill_method=None)
+        .replace([np.inf, -np.inf], np.nan)
+        .dropna()
+    )
+
+    if not returns.empty:
+
+        result["volatilidade_anual"] = (
+            returns.std(ddof=1)
+            * np.sqrt(252)
         )
-        .mean()
-    )
 
-    sma50 = (
-        close
-        .rolling(
-            SMA_MEDIUM
+        result["maior_retorno_abs"] = (
+            returns.abs().max()
         )
-        .mean()
-    )
 
-    sma200 = (
-        close
-        .rolling(
-            SMA_LONG
+        result["eventos_extremos"] = int(
+            (
+                returns.abs()
+                > EXTREME_RETURN_ALERT
+            ).sum()
         )
-        .mean()
-    )
 
 
-    sma20_last = (
-        sma20.iloc[-1]
-    )
+    # --------------------------------------------------------
+    # DRAWDOWN
+    # --------------------------------------------------------
 
-    sma50_last = (
-        sma50.iloc[-1]
-    )
+    running_max = close.cummax()
 
-    sma200_last = (
-        sma200.iloc[-1]
-    )
+    drawdown = (
+        close / running_max
+    ) - 1
 
+    if not drawdown.empty:
 
-    result[
-        "dist_sma20"
-    ] = (
-        safe_div(
-            preco,
-            sma20_last
+        result["drawdown_5a"] = (
+            drawdown.min()
         )
-        - 1
-    )
 
 
-    result[
-        "dist_sma50"
-    ] = (
-        safe_div(
-            preco,
-            sma50_last
-        )
-        - 1
-    )
+    # --------------------------------------------------------
+    # LIQUIDEZ
+    # --------------------------------------------------------
 
-
-    result[
-        "dist_sma200"
-    ] = (
-        safe_div(
-            preco,
-            sma200_last
-        )
-        - 1
-    )
-
-
-    # ========================================================
-    # MÁXIMA 52 SEMANAS
-    # ========================================================
-
-    janela_52s = (
-        close
-        .tail(
-            HIGH_52W_WINDOW
-        )
-    )
-
-    max_52 = (
-        janela_52s.max()
-    )
-
-    result[
-        "distancia_max_52s"
-    ] = (
-        safe_div(
-            preco,
-            max_52
-        )
-        - 1
-    )
-
-
-    # ========================================================
-    # VOLUME RELATIVO
-    # ========================================================
-
-    if "Volume" in hist.columns:
+    if "Volume" in history.columns:
 
         volume = pd.to_numeric(
-            hist["Volume"],
+            history["Volume"],
             errors="coerce"
         )
 
-        volume_avg = (
-            volume
-            .rolling(
-                VOLUME_WINDOW
+        market_value = (
+            pd.to_numeric(
+                history["Close"],
+                errors="coerce"
             )
-            .mean()
+            * volume
         )
 
-        if (
-            len(volume_avg.dropna()) > 0
-            and volume_avg.iloc[-1] > 0
-        ):
+        liquidity = (
+            market_value
+            .replace(
+                [np.inf, -np.inf],
+                np.nan
+            )
+            .dropna()
+            .tail(LIQUIDITY_WINDOW)
+        )
+
+        if not liquidity.empty:
 
             result[
-                "volume_relativo"
-            ] = (
-                volume.iloc[-1]
-                /
-                volume_avg.iloc[-1]
-            )
-
-
-    # ========================================================
-    # SCORE DE TENDÊNCIA
-    # ========================================================
-
-    trend_score = 0
-
-
-    if preco > sma20_last:
-
-        trend_score += 20
-
-
-    if preco > sma50_last:
-
-        trend_score += 20
-
-
-    if preco > sma200_last:
-
-        trend_score += 25
-
-
-    if (
-        sma20_last
-        >
-        sma50_last
-    ):
-
-        trend_score += 15
-
-
-    if (
-        sma50_last
-        >
-        sma200_last
-    ):
-
-        trend_score += 20
-
-
-    result[
-        "score_tendencia"
-    ] = trend_score
-
-
-    # ========================================================
-    # SCORE RSI
-    # ========================================================
-
-    rsi_value = result[
-        "rsi14"
-    ]
-
-
-    if pd.isna(rsi_value):
-
-        score_rsi = 50
-
-    elif 35 <= rsi_value <= 55:
-
-        score_rsi = 100
-
-    elif 30 <= rsi_value < 35:
-
-        score_rsi = 90
-
-    elif 55 < rsi_value <= 65:
-
-        score_rsi = 80
-
-    elif 25 <= rsi_value < 30:
-
-        score_rsi = 75
-
-    elif 65 < rsi_value <= RSI_OVERBOUGHT:
-
-        score_rsi = 60
-
-    elif rsi_value < 25:
-
-        score_rsi = 55
-
-    else:
-
-        score_rsi = 35
-
-
-    # ========================================================
-    # SCORE MOMENTUM
-    # ========================================================
-
-    r1 = result[
-        "retorno_1m"
-    ]
-
-    r3 = result[
-        "retorno_3m"
-    ]
-
-    r6 = result[
-        "retorno_6m"
-    ]
-
-
-    momentum_score = 50
-
-
-    if not pd.isna(r1):
-
-        if -0.04 <= r1 <= 0.04:
-
-            momentum_score += 10
-
-        elif r1 > 0.08:
-
-            momentum_score -= 10
-
-
-    if not pd.isna(r3):
-
-        if r3 > 0:
-
-            momentum_score += 15
-
-        elif r3 < -0.10:
-
-            momentum_score -= 10
-
-
-    if not pd.isna(r6):
-
-        if r6 > 0:
-
-            momentum_score += 15
-
-        elif r6 < -0.15:
-
-            momentum_score -= 10
-
-
-    momentum_score = clip_score(
-        momentum_score
-    )
-
-
-    # ========================================================
-    # SCORE DISTÂNCIA DAS MÉDIAS
-    # ========================================================
-
-    d20 = result[
-        "dist_sma20"
-    ]
-
-    d50 = result[
-        "dist_sma50"
-    ]
-
-    d200 = result[
-        "dist_sma200"
-    ]
-
-
-    distance_score = 50
-
-
-    if (
-        not pd.isna(d20)
-        and -0.04 <= d20 <= 0.03
-    ):
-
-        distance_score += 15
-
-
-    if (
-        not pd.isna(d50)
-        and -0.05 <= d50 <= 0.05
-    ):
-
-        distance_score += 15
-
-
-    if (
-        not pd.isna(d200)
-        and d200 >= 0
-    ):
-
-        distance_score += 20
-
-
-    distance_score = clip_score(
-        distance_score
-    )
-
-
-    # ========================================================
-    # SCORE VOLUME
-    # ========================================================
-
-    vr = result[
-        "volume_relativo"
-    ]
-
-
-    if pd.isna(vr):
-
-        score_volume = 50
-
-    elif vr >= 1.5:
-
-        score_volume = 100
-
-    elif vr >= 1.2:
-
-        score_volume = 85
-
-    elif vr >= 0.9:
-
-        score_volume = 70
-
-    elif vr >= 0.7:
-
-        score_volume = 55
-
-    else:
-
-        score_volume = 40
-
-
-    # ========================================================
-    # PENALIDADE DE ESTIRAMENTO
-    # ========================================================
-
-    penalty = 0
-
-
-    if (
-        not pd.isna(d200)
-        and d200 > MAX_DISTANCE_SMA200
-    ):
-
-        penalty -= 15
-
-
-    if (
-        not pd.isna(r1)
-        and r1 > 0.12
-    ):
-
-        penalty -= 10
-
-
-    if (
-        not pd.isna(r3)
-        and r3 > 0.20
-    ):
-
-        penalty -= 10
-
-
-    if (
-        not pd.isna(rsi_value)
-        and rsi_value > RSI_OVERBOUGHT
-    ):
-
-        penalty -= 10
-
-
-    result[
-        "penalidade_estiramento"
-    ] = penalty
-
-
-    # ========================================================
-    # TECHNICAL SCORE
-    # ========================================================
-
-    technical_score = (
-
-        trend_score * 0.35
-
-        +
-
-        score_rsi * 0.20
-
-        +
-
-        momentum_score * 0.20
-
-        +
-
-        distance_score * 0.15
-
-        +
-
-        score_volume * 0.10
-
-        +
-
-        penalty
-
-    )
-
-
-    technical_score = clip_score(
-        technical_score
-    )
-
-
-    result[
-        "technical_score"
-    ] = technical_score
-
-
-    # ========================================================
-    # CLASSIFICAÇÃO
-    # ========================================================
-
-    if technical_score >= 90:
-
-        classificacao = (
-            "TIMING EXCELENTE"
-        )
-
-    elif technical_score >= 80:
-
-        classificacao = (
-            "TIMING FORTE"
-        )
-
-    elif technical_score >= 65:
-
-        classificacao = (
-            "TIMING BOM"
-        )
-
-    elif technical_score >= 50:
-
-        classificacao = (
-            "NEUTRO"
-        )
-
-    elif technical_score >= 40:
-
-        classificacao = (
-            "AGUARDAR"
-        )
-
-    else:
-
-        classificacao = (
-            "TIMING RUIM"
-        )
-
-
-    result[
-        "classificacao_tecnica"
-    ] = classificacao
-
-
-    # ========================================================
-    # STATUS DE TIMING
-    # ========================================================
-
-    if (
-        technical_score
-        >=
-        TECHNICAL_STRONG
-    ):
-
-        status = (
-            "ENTRADA TÉCNICA FORTE"
-        )
-
-    elif (
-        technical_score
-        >=
-        TECHNICAL_ACCEPTABLE
-    ):
-
-        status = (
-            "ENTRADA TÉCNICA ACEITÁVEL"
-        )
-
-    else:
-
-        status = (
-            "AGUARDAR CONFIRMAÇÃO"
-        )
-
-
-    result[
-        "status_timing"
-    ] = status
-
+                "liquidez_media_60d"
+            ] = liquidity.mean()
 
     return result
 
 
 # ============================================================
-# 5. MOTOR PRINCIPAL
+# REGRA ZERO
 # ============================================================
 
-def run_technical_engine(
-    fundamentals
-):
+def _apply_rule_zero(df):
+
+    df = df.copy()
+
+
+    # --------------------------------------------------------
+    # HISTÓRICO
+    # --------------------------------------------------------
+
+    df["rule_history_ok"] = (
+        df["observacoes_preco"]
+        >= RULE_ZERO_MIN_HISTORY
+    )
+
+
+    # --------------------------------------------------------
+    # PREÇO
+    # --------------------------------------------------------
+
+    if RULE_ZERO_REQUIRE_PRICE:
+
+        df["rule_price_ok"] = (
+            df["preco"].notna()
+            & (df["preco"] > 0)
+        )
+
+    else:
+
+        df["rule_price_ok"] = True
+
+
+    # --------------------------------------------------------
+    # LIQUIDEZ
+    # --------------------------------------------------------
+
+    if RULE_ZERO_REQUIRE_LIQUIDITY:
+
+        df["rule_liquidity_ok"] = (
+            df["liquidez_media_60d"]
+            .fillna(0)
+            >= MIN_LIQUIDITY
+        )
+
+    else:
+
+        df["rule_liquidity_ok"] = True
+
+
+    # --------------------------------------------------------
+    # CLASSIFICAÇÃO
+    # --------------------------------------------------------
+
+    if RULE_ZERO_REQUIRE_CATEGORY:
+
+        df["rule_category_ok"] = (
+            df["categoria_motor"].notna()
+            & df["segmento"].notna()
+        )
+
+    else:
+
+        df["rule_category_ok"] = True
+
+
+    # --------------------------------------------------------
+    # RESULTADO
+    # --------------------------------------------------------
+
+    df["regra_zero_aprovado"] = (
+
+        df["rule_history_ok"]
+
+        & df["rule_price_ok"]
+
+        & df["rule_liquidity_ok"]
+
+        & df["rule_category_ok"]
+    )
+
+    return df
+
+
+# ============================================================
+# AUDITORIA
+# ============================================================
+
+def _print_audit(df):
 
     print()
-    print("=" * 100)
-    print("MOTOR TÉCNICO")
-    print("=" * 100)
+    print("=" * 90)
+    print("DATA ENGINE — AUDITORIA")
+    print("=" * 90)
+
+    print(
+        f"Universo configurado       : {len(df)}"
+    )
+
+    print(
+        "Com histórico suficiente  :",
+        int(df["rule_history_ok"].sum())
+    )
+
+    print(
+        "Com preço válido           :",
+        int(df["rule_price_ok"].sum())
+    )
+
+    print(
+        "Com liquidez mínima        :",
+        int(df["rule_liquidity_ok"].sum())
+    )
+
+    print(
+        "Regra Zero aprovada        :",
+        int(df["regra_zero_aprovado"].sum())
+    )
 
 
-    # ========================================================
-    # SOMENTE APROVADOS NO FUNDAMENTAL
-    # ========================================================
+    extreme = df[
+        df["eventos_extremos"] > 0
+    ]
 
-    approved = (
+    structural = df[
+        df[
+            "eventos_estruturais_detectados"
+        ] > 0
+    ]
 
-        fundamentals[
-            fundamentals[
-                "fundamental_aprovado_final"
+    print(
+        "Com evento diário extremo  :",
+        len(extreme)
+    )
+
+    print(
+        "Com evento estrutural corrigido:",
+        len(structural)
+    )
+
+
+    failed_collection = df[
+        df[
+            "status_coleta"
+        ] != "OK"
+    ]
+
+    print(
+        "Falhas definitivas de coleta:",
+        len(
+            failed_collection
+        )
+    )
+
+    if not failed_collection.empty:
+
+        print()
+        print(
+            "ATENÇÃO — FALHAS DE COLETA"
+        )
+
+        print(
+            failed_collection[
+                [
+                    "ticker",
+                    "status_coleta",
+                    "regra_zero_aprovado",
+                ]
             ]
+            .to_string(
+                index=False
+            )
+        )
+
+
+    if not structural.empty:
+
+        print()
+        print(
+            "EVENTOS ESTRUTURAIS CORRIGIDOS"
+        )
+
+        print(
+            structural[
+                [
+                    "ticker",
+                    "eventos_estruturais_detectados",
+                    "maior_retorno_abs",
+                    "volatilidade_anual",
+                    "drawdown_5a",
+                ]
+            ]
+            .to_string(
+                index=False
+            )
+        )
+
+
+    if not extreme.empty:
+
+        print()
+        print(
+            "ATENÇÃO — EVENTOS EXTREMOS APÓS HIGIENE"
+        )
+
+        cols = [
+            "ticker",
+            "maior_retorno_abs",
+            "eventos_extremos",
         ]
 
-        .copy()
+        print(
+            extreme[cols]
+            .sort_values(
+                "maior_retorno_abs",
+                ascending=False
+            )
+            .to_string(index=False)
+        )
 
+
+# ============================================================
+# BUILD DATABASE
+# ============================================================
+
+def build_database():
+
+    Path(DATA_DIR).mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    print()
+    print(
+        f"Coletando dados de "
+        f"{len(FII_UNIVERSE)} FIIs..."
+    )
+
+    records = []
+
+
+    for ticker, (
+        categoria,
+        segmento
+    ) in tqdm(
+        FII_UNIVERSE.items(),
+        desc="Data Engine"
+    ):
+
+        history = _download_history(
+            ticker
+        )
+
+        metrics = (
+            _calculate_market_metrics(
+                ticker,
+                history
+            )
+        )
+
+        metrics[
+            "categoria_motor"
+        ] = categoria
+
+        metrics[
+            "segmento"
+        ] = segmento
+
+        records.append(
+            metrics
+        )
+
+
+    database = pd.DataFrame(
+        records
+    )
+
+
+    # ========================================================
+    # TIPOS
+    # ========================================================
+
+    numeric_columns = [
+
+        "preco",
+        "observacoes_preco",
+        "liquidez_media_60d",
+        "volatilidade_anual",
+        "drawdown_5a",
+        "maior_retorno_abs",
+        "eventos_extremos",
+        "eventos_estruturais_detectados",
+    ]
+
+    for col in numeric_columns:
+
+        if col in database.columns:
+
+            database[col] = (
+                pd.to_numeric(
+                    database[col],
+                    errors="coerce"
+                )
+            )
+
+
+    # ========================================================
+    # REGRA ZERO
+    # ========================================================
+
+    database = _apply_rule_zero(
+        database
+    )
+
+
+    # ========================================================
+    # ORDENAR
+    # ========================================================
+
+    database = database.sort_values(
+        [
+            "regra_zero_aprovado",
+            "liquidez_media_60d",
+        ],
+        ascending=[
+            False,
+            False,
+        ],
+    ).reset_index(
+        drop=True
+    )
+
+
+    # ========================================================
+    # SALVAR UNIVERSO COMPLETO
+    # ========================================================
+
+    if SAVE_UNIVERSE:
+
+        database.to_csv(
+            UNIVERSE_FILE,
+            index=False,
+            encoding="utf-8-sig"
+        )
+
+
+    _print_audit(
+        database
+    )
+
+
+    # ========================================================
+    # RETORNO AO PIPELINE
+    # ========================================================
+
+    approved = database[
+        database[
+            "regra_zero_aprovado"
+        ]
+    ].copy()
+
+    approved = approved.reset_index(
+        drop=True
     )
 
 
     if approved.empty:
 
         raise RuntimeError(
-            "Nenhum FII aprovado no filtro fundamental."
+            "Nenhum FII passou pela Regra Zero."
         )
 
-
-    print(
-        f"FIIs aprovados para análise técnica: "
-        f"{len(approved)}"
-    )
-
-
-    # ========================================================
-    # COLETA
-    # ========================================================
-
-    records = []
-
-
-    for ticker in tqdm(
-
-        approved[
-            "ticker"
-        ].tolist(),
-
-        desc="Motor Técnico"
-
-    ):
-
-        records.append(
-            _calculate_indicators(
-                ticker
-            )
-        )
-
-
-    technical = pd.DataFrame(
-        records
-    )
-
-
-    # ========================================================
-    # JUNTA DADOS FUNDAMENTAIS
-    # ========================================================
-
-    cols_fund = [
-
-        "ticker",
-
-        "categoria_motor",
-
-        "segmento",
-
-        "fundamental_score_final",
-
-        "status_fundamental",
-
-    ]
-
-
-    technical = technical.merge(
-
-        approved[
-            cols_fund
-        ],
-
-        on="ticker",
-
-        how="left"
-
-    )
-
-
-    # ========================================================
-    # RANKING
-    # ========================================================
-
-    technical = (
-
-        technical
-
-        .sort_values(
-            "technical_score",
-            ascending=False
-        )
-
-        .reset_index(
-            drop=True
-        )
-
-    )
-
-
-    technical[
-        "ranking_tecnico"
-    ] = np.arange(
-        1,
-        len(technical) + 1
-    )
-
-
-    # ========================================================
-    # AUDITORIA
-    # ========================================================
 
     print()
     print(
-        "STATUS DE TIMING:"
+        f"FIIs enviados ao motor "
+        f"fundamentalista: {len(approved)}"
     )
 
-    print(
-
-        technical[
-            "status_timing"
-        ]
-        .value_counts()
-        .to_string()
-
-    )
-
-
-    print()
-    print("=" * 100)
-    print("TOP 15 TÉCNICO")
-    print("=" * 100)
-
-
-    cols = [
-
-        "ranking_tecnico",
-
-        "ticker",
-
-        "categoria_motor",
-
-        "segmento",
-
-        "fundamental_score_final",
-
-        "technical_score",
-
-        "classificacao_tecnica",
-
-        "status_timing",
-
-        "rsi14",
-
-        "retorno_1m",
-
-        "retorno_3m",
-
-        "retorno_6m",
-
-        "dist_sma20",
-
-        "dist_sma50",
-
-        "dist_sma200",
-
-        "volume_relativo",
-
-        "fonte_historico_tecnico",
-
-    ]
-
-
-    print(
-
-        technical[
-            cols
-        ]
-
-        .head(15)
-
-        .to_string(
-            index=False
-        )
-
-    )
-
-
-    print()
-    print("=" * 100)
-    print("MOTOR TÉCNICO CONCLUÍDO")
-    print("=" * 100)
-
-
-    return technical
+    return approved
