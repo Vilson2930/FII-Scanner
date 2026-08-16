@@ -2159,6 +2159,38 @@ def build_database():
     )
 
     # ========================================================
+    # DTYPE SEGURO PARA CAMPOS CVM
+    # ========================================================
+
+    for text_col in [
+        "cnpj_cvm",
+        "nome_cvm",
+        "fonte_valuation",
+    ]:
+
+        if text_col in database.columns:
+
+            database[
+                text_col
+            ] = database[
+                text_col
+            ].astype(
+                "object"
+            )
+
+    if "data_referencia_cvm" in database.columns:
+
+        database[
+            "data_referencia_cvm"
+        ] = pd.to_datetime(
+            database[
+                "data_referencia_cvm"
+            ],
+            errors="coerce"
+        )
+
+
+    # ========================================================
     # FALLBACK OFICIAL CVM — UMA COLETA POR EXECUÇÃO
     # ========================================================
 
@@ -2210,10 +2242,69 @@ def build_database():
 
             for key, value in cvm_data.items():
 
+                # ------------------------------------------------
+                # GARANTIA DE DTYPE
+                # ------------------------------------------------
+                #
+                # Pandas 3.x é mais rígido ao inserir strings em
+                # colunas previamente criadas como float64.
+                # Campos textuais da CVM precisam nascer como
+                # dtype object; campos de data como datetime;
+                # métricas numéricas podem continuar float.
+                #
                 if key not in database.columns:
+
+                    if key in {
+                        "cnpj_cvm",
+                        "nome_cvm",
+                        "fonte_valuation",
+                    }:
+
+                        database[
+                            key
+                        ] = pd.Series(
+                            [None] * len(database),
+                            dtype="object"
+                        )
+
+                    elif key == "data_referencia_cvm":
+
+                        database[
+                            key
+                        ] = pd.Series(
+                            pd.NaT,
+                            index=database.index,
+                            dtype="datetime64[ns]"
+                        )
+
+                    else:
+
+                        database[
+                            key
+                        ] = np.nan
+
+                # Se a coluna já existe, força dtype compatível
+                # para os campos textuais antes da atribuição.
+                if key in {
+                    "cnpj_cvm",
+                    "nome_cvm",
+                    "fonte_valuation",
+                }:
+
                     database[
                         key
-                    ] = np.nan
+                    ] = database[
+                        key
+                    ].astype(
+                        "object"
+                    )
+
+                if key == "data_referencia_cvm":
+
+                    value = pd.to_datetime(
+                        value,
+                        errors="coerce"
+                    )
 
                 database.loc[
                     mask,
