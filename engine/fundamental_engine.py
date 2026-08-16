@@ -39,6 +39,19 @@ warnings.filterwarnings("ignore")
 
 
 # ============================================================
+# ATIVOS COM MOTOR PRÓPRIO
+# ============================================================
+#
+# Estes ativos NÃO competem diretamente no motor comum.
+# No estudo original, SNEL11 foi classificado como
+# "MOTOR ESPECIAL NECESSÁRIO".
+#
+SPECIAL_MOTOR_TICKERS = {
+    "SNEL11",
+}
+
+
+# ============================================================
 # 1. FUNÇÕES BÁSICAS
 # ============================================================
 
@@ -1159,6 +1172,14 @@ def _score_alternative(row):
 
 def _calculate_base_score(row):
 
+    ticker = row.get(
+        "ticker"
+    )
+
+    # Ativo especial: não entra no motor comum.
+    if ticker in SPECIAL_MOTOR_TICKERS:
+        return np.nan
+
     categoria = row[
         "categoria_motor"
     ]
@@ -1406,6 +1427,29 @@ def run_fundamental_engine(database):
 
 
     # ========================================================
+    # MOTOR UTILIZADO
+    # ========================================================
+
+    base[
+        "motor_fundamental"
+    ] = np.select(
+        [
+            base["ticker"].isin(SPECIAL_MOTOR_TICKERS),
+            base["categoria_motor"].eq("PAPEL"),
+            base["categoria_motor"].eq("TIJOLO"),
+            base["categoria_motor"].eq("ALTERNATIVO"),
+        ],
+        [
+            "MOTOR_ESPECIAL",
+            "MOTOR_PAPEL",
+            "MOTOR_TIJOLO",
+            "MOTOR_ALTERNATIVO",
+        ],
+        default="SEM_MOTOR"
+    )
+
+
+    # ========================================================
     # CONFIANÇA
     # ========================================================
 
@@ -1443,6 +1487,20 @@ def run_fundamental_engine(database):
     )
 
 
+    # Ativos especiais ficam fora do ranking comum até terem
+    # um motor específico próprio.
+    mask_special = base[
+        "ticker"
+    ].isin(
+        SPECIAL_MOTOR_TICKERS
+    )
+
+    base.loc[
+        mask_special,
+        "status_fundamental"
+    ] = "MOTOR ESPECIAL NECESSÁRIO"
+
+
     # ========================================================
     # GATE
     # ========================================================
@@ -1476,6 +1534,16 @@ def run_fundamental_engine(database):
             ]
             >=
             MIN_DATA_CONFIDENCE
+        )
+
+        &
+
+        (
+            ~base[
+                "ticker"
+            ].isin(
+                SPECIAL_MOTOR_TICKERS
+            )
         )
 
     )
@@ -1562,6 +1630,8 @@ def run_fundamental_engine(database):
 
         "categoria_motor",
 
+        "motor_fundamental",
+
         "segmento",
 
         "fundamental_score_final",
@@ -1601,6 +1671,36 @@ def run_fundamental_engine(database):
 
     )
 
+
+    especiais = base[
+        base[
+            "ticker"
+        ].isin(
+            SPECIAL_MOTOR_TICKERS
+        )
+    ]
+
+    if not especiais.empty:
+
+        print()
+        print("=" * 100)
+        print("ATIVOS ESPECIAIS — FORA DO MOTOR COMUM")
+        print("=" * 100)
+
+        print(
+            especiais[
+                [
+                    "ticker",
+                    "categoria_motor",
+                    "segmento",
+                    "status_fundamental",
+                    "fundamental_aprovado_final",
+                ]
+            ]
+            .to_string(
+                index=False
+            )
+        )
 
     print()
     print("=" * 100)
