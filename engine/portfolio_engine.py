@@ -1435,8 +1435,21 @@ def _portfolio_diagnostics(
     raw_returns,
     robust_returns,
     extreme_count,
-    masks
+    masks=None
 ):
+
+    # ========================================================
+    # ALINHAMENTO DE ORDEM
+    # ========================================================
+    #
+    # As máscaras precisam ser construídas na mesma ordem dos
+    # pesos usados nos diagnósticos. Isso evita exposição por
+    # categoria/segmento incorreta quando o DataFrame é
+    # reordenado para exibição.
+    #
+    masks = _build_masks(
+        portfolio
+    )
 
     w = (
 
@@ -1881,26 +1894,6 @@ def build_portfolio(
 
 
     # ========================================================
-    # RANKING FINAL
-    # ========================================================
-
-    portfolio = (
-
-        portfolio
-
-        .sort_values(
-            "peso_estrategico",
-            ascending=False
-        )
-
-        .reset_index(
-            drop=True
-        )
-
-    )
-
-
-    # ========================================================
     # MARCA CANDIDATOS NO RANKING
     # ========================================================
 
@@ -1952,6 +1945,31 @@ def build_portfolio(
     diagnostics[
         "optimization_message"
     ] = optimization_result.message
+
+
+    # ========================================================
+    # ORDENAÇÃO FINAL — SOMENTE PARA SAÍDA
+    # ========================================================
+    #
+    # Até este ponto a ordem do DataFrame deve permanecer
+    # idêntica à ordem usada na matriz de covariância e na
+    # otimização. Só agora podemos ordenar por peso para
+    # relatório, CSV e visualização.
+    #
+    portfolio = (
+
+        portfolio
+
+        .sort_values(
+            "peso_estrategico",
+            ascending=False
+        )
+
+        .reset_index(
+            drop=True
+        )
+
+    )
 
 
     # ========================================================
@@ -2085,6 +2103,28 @@ def build_portfolio(
         print(
             f"{key:<20}: "
             f"{value:.2%}"
+        )
+
+
+    # Auditoria independente do alinhamento de máscaras
+    exposicao_categoria_check = (
+        portfolio
+        .groupby(
+            "categoria_motor"
+        )[
+            "peso_estrategico"
+        ]
+        .sum()
+    )
+
+    print()
+    print("AUDITORIA DE EXPOSIÇÃO POR CATEGORIA:")
+
+    for categoria, peso in exposicao_categoria_check.items():
+
+        print(
+            f"{categoria:<20}: "
+            f"{peso:.2%}"
         )
 
 
