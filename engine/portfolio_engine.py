@@ -431,11 +431,7 @@ def _select_portfolio_candidates(ranking):
         )
 
 
-    # ========================================================
-    # PRIMEIRA SELEÇÃO
-    # ========================================================
-
-    selected = (
+    approved = (
 
         approved
 
@@ -450,51 +446,98 @@ def _select_portfolio_candidates(ranking):
             ]
         )
 
+        .reset_index(
+            drop=True
+        )
+
+    )
+
+
+    # ========================================================
+    # PRIMEIRA SELEÇÃO — RANKING PURO
+    # ========================================================
+
+    selected = (
+
+        approved
+
         .head(
             PORTFOLIO_SIZE
         )
 
         .copy()
 
+        .reset_index(
+            drop=True
+        )
+
     )
 
 
     # ========================================================
-    # DIVERSIFICAÇÃO MÍNIMA
+    # DIVERSIFICAÇÃO E VIABILIDADE ESTRUTURAL
     # ========================================================
     #
-    # Caso o ranking puro selecione concentração extrema,
-    # tentamos preservar:
+    # O portfólio tem limites máximos por categoria.
     #
-    # - Papel
-    # - Tijolo
-    # - Alternativo
+    # Se a carteira tiver somente PAPEL + TIJOLO e:
     #
+    #   MAX_PAPER + MAX_BRICK < 100%
+    #
+    # então nenhuma combinação de pesos pode somar 100%.
+    #
+    # No estudo validado, o bloco ALTERNATIVO funciona como
+    # terceira perna estrutural da carteira.
+    #
+    # Portanto, quando houver fundos alternativos aprovados,
+    # garantimos a presença de pelo menos um deles.
+    #
+    # Também garantimos PAPEL e TIJOLO quando disponíveis.
     # ========================================================
 
-    categorias = set(
-        selected[
+    available_categories = set(
+        approved[
             "categoria_motor"
-        ].tolist()
+        ].dropna().tolist()
     )
 
-
-    required = {
-        "PAPEL",
-        "TIJOLO",
-    }
-
-
-    missing = (
-        required
-        -
-        categorias
-    )
+    required_categories = [
+        categoria
+        for categoria in [
+            "PAPEL",
+            "TIJOLO",
+            "ALTERNATIVO",
+        ]
+        if categoria in available_categories
+    ]
 
 
-    for categoria in missing:
+    def category_counts(df):
 
-        candidate = (
+        return (
+            df[
+                "categoria_motor"
+            ]
+            .value_counts()
+            .to_dict()
+        )
+
+
+    def replace_with_category(
+        current,
+        categoria
+    ):
+
+        if categoria in set(
+            current[
+                "categoria_motor"
+            ].tolist()
+        ):
+
+            return current
+
+
+        candidate_pool = (
 
             approved[
                 approved[
@@ -504,65 +547,193 @@ def _select_portfolio_candidates(ranking):
                 categoria
             ]
 
+            [
+                ~approved[
+                    "ticker"
+                ]
+                .isin(
+                    current[
+                        "ticker"
+                    ]
+                )
+            ]
+
             .sort_values(
-                "institutional_score",
-                ascending=False
+                [
+                    "institutional_score",
+                    "fundamental_score_final",
+                ],
+                ascending=[
+                    False,
+                    False,
+                ]
             )
 
         )
 
 
-        if candidate.empty:
-            continue
+        if candidate_pool.empty:
+
+            return current
 
 
-        new_row = candidate.iloc[0]
+        new_row = candidate_pool.iloc[0]
+
+        counts = category_counts(
+            current
+        )
 
 
-        # substitui o pior selecionado
+        # Só removemos um fundo de uma categoria que continuará
+        # representada depois da troca. Assim uma correção não
+        # destrói outra categoria obrigatória.
+        removable = current[
+            current[
+                "categoria_motor"
+            ].map(
+                lambda cat:
+                    counts.get(
+                        cat,
+                        0
+                    ) > 1
+                    or
+                    cat not in required_categories
+            )
+        ].copy()
 
-        pior_idx = (
 
-            selected[
+        if removable.empty:
+
+            # Último recurso: pior institucional.
+            removable = current.copy()
+
+
+        worst_idx = (
+            removable[
                 "institutional_score"
             ]
+            .astype(float)
             .idxmin()
-
         )
 
 
-        selected = selected.drop(
-            index=pior_idx
+        current = current.drop(
+            index=worst_idx
         )
 
 
-        selected = pd.concat(
-
+        current = pd.concat(
             [
-                selected,
-                new_row.to_frame().T
+                current,
+                new_row.to_frame().T,
             ],
-
             ignore_index=True
-
         )
 
+
+        return current
+
+
+    for categoria in required_categories:
+
+        selected = replace_with_category(
+            selected,
+            categoria
+        )
+
+
+    # ========================================================
+    # CHECAGEM DE CAPACIDADE POR CATEGORIA
+    # ========================================================
+    #
+    # Mesmo com todas as categorias, confirmamos que a soma das
+    # capacidades máximas das categorias presentes alcança 100%.
+    # Caso contrário, tentamos inserir a melhor categoria ausente.
+    # ========================================================
+
+    def category_capacity(df):
+
+        cats = set(
+            df[
+                "categoria_motor"
+            ].tolist()
+        )
+
+        capacity = 0.0
+
+        if "PAPEL" in cats:
+            capacity += MAX_PAPER
+
+        if "TIJOLO" in cats:
+            capacity += MAX_BRICK
+
+        if "ALTERNATIVO" in cats:
+            capacity += MAX_ALTERNATIVE
+
+        return float(
+            capacity
+        )
+
+
+    capacity = category_capacity(
+        selected
+    )
+
+
+    if capacity < 1.0 - 1e-9:
+
+        for categoria in [
+            "ALTERNATIVO",
+            "PAPEL",
+            "TIJOLO",
+        ]:
+
+            if (
+                categoria in available_categories
+                and categoria
+                not in set(
+                    selected[
+                        "categoria_motor"
+                    ].tolist()
+                )
+            ):
+
+                selected = replace_with_category(
+                    selected,
+                    categoria
+                )
+
+                capacity = category_capacity(
+                    selected
+                )
+
+                if capacity >= 1.0 - 1e-9:
+                    break
+
+
+    # ========================================================
+    # LIMPEZA / COMPLEMENTO
+    # ========================================================
 
     selected = (
 
         selected
 
         .drop_duplicates(
-            subset=["ticker"]
+            subset=[
+                "ticker"
+            ]
         )
 
         .sort_values(
-            "institutional_score",
-            ascending=False
-        )
-
-        .head(
-            PORTFOLIO_SIZE
+            [
+                "institutional_score",
+                "fundamental_score_final",
+            ],
+            ascending=[
+                False,
+                False,
+            ]
         )
 
         .reset_index(
@@ -588,8 +759,14 @@ def _select_portfolio_candidates(ranking):
             ]
 
             .sort_values(
-                "institutional_score",
-                ascending=False
+                [
+                    "institutional_score",
+                    "fundamental_score_final",
+                ],
+                ascending=[
+                    False,
+                    False,
+                ]
             )
 
         )
@@ -603,16 +780,72 @@ def _select_portfolio_candidates(ranking):
 
 
         selected = pd.concat(
-
             [
                 selected,
                 restantes.head(
                     needed
-                )
+                ),
             ],
-
             ignore_index=True
+        )
 
+
+    selected = (
+
+        selected
+
+        .head(
+            PORTFOLIO_SIZE
+        )
+
+        .reset_index(
+            drop=True
+        )
+
+    )
+
+
+    # ========================================================
+    # AUDITORIA DA SELEÇÃO
+    # ========================================================
+
+    counts = (
+        selected[
+            "categoria_motor"
+        ]
+        .value_counts()
+    )
+
+
+    print(
+        "Composição dos 10 selecionados:"
+    )
+
+    for categoria, quantidade in counts.items():
+
+        print(
+            f"  {categoria:<15}: "
+            f"{int(quantidade)}"
+        )
+
+
+    capacity = category_capacity(
+        selected
+    )
+
+
+    print(
+        "Capacidade máxima das categorias presentes: "
+        f"{capacity:.2%}"
+    )
+
+
+    if capacity < 1.0 - 1e-9:
+
+        raise RuntimeError(
+            "Seleção estruturalmente inviável: "
+            "a soma dos limites máximos das categorias "
+            f"presentes é apenas {capacity:.2%}."
         )
 
 
