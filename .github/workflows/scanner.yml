@@ -67,6 +67,7 @@ jobs:
 
           mkdir -p data
           mkdir -p reports
+          mkdir -p outputs
 
 
       # ======================================================
@@ -102,9 +103,460 @@ jobs:
 
           ls -lah reports || true
 
+          echo ""
+
+          echo "=============================="
+          echo "INVESTMENT CIO OUTPUT"
+          echo "=============================="
+
+          ls -lah outputs || true
+
 
       # ======================================================
-      # 7. UPLOAD DO RANKING
+      # 7. VALIDAÇÃO DO JSON PARA O CIO
+      # ======================================================
+
+      - name: Validate Investment CIO output
+
+        run: |
+
+          python - <<'PY'
+
+          import json
+          import math
+          from pathlib import Path
+
+
+          path = Path(
+              "outputs/agent_output_raw.json"
+          )
+
+
+          if not path.exists():
+
+              raise SystemExit(
+                  "ERRO: outputs/agent_output_raw.json "
+                  "não foi gerado."
+              )
+
+
+          with path.open(
+              "r",
+              encoding="utf-8"
+          ) as file:
+
+              data = json.load(file)
+
+
+          # ================================================
+          # SOURCE SYSTEM
+          # ================================================
+
+          expected_source = (
+              "FII_INSTITUTIONAL_SCANNER"
+          )
+
+          if data.get(
+              "source_system"
+          ) != expected_source:
+
+              raise SystemExit(
+                  "ERRO: source_system inválido. "
+                  f"Recebido: "
+                  f"{data.get('source_system')}"
+              )
+
+
+          # ================================================
+          # ESTRUTURA PRINCIPAL
+          # ================================================
+
+          required_keys = [
+
+              "source_system",
+              "export_version",
+              "generated_at",
+              "summary",
+              "database",
+              "fundamentals",
+              "technical",
+              "ranking",
+              "portfolio",
+              "diagnostics",
+              "metadata",
+
+          ]
+
+
+          missing = [
+
+              key
+
+              for key
+              in required_keys
+
+              if key not in data
+
+          ]
+
+
+          if missing:
+
+              raise SystemExit(
+                  "ERRO: campos ausentes no JSON: "
+                  + ", ".join(
+                      missing
+                  )
+              )
+
+
+          # ================================================
+          # TIPOS PRINCIPAIS
+          # ================================================
+
+          for key in [
+
+              "database",
+              "fundamentals",
+              "technical",
+              "ranking",
+              "portfolio",
+
+          ]:
+
+              if not isinstance(
+                  data[key],
+                  list
+              ):
+
+                  raise SystemExit(
+                      f"ERRO: {key} não é lista."
+                  )
+
+
+          if not isinstance(
+              data["diagnostics"],
+              dict
+          ):
+
+              raise SystemExit(
+                  "ERRO: diagnostics não é objeto."
+              )
+
+
+          if not isinstance(
+              data["summary"],
+              dict
+          ):
+
+              raise SystemExit(
+                  "ERRO: summary não é objeto."
+              )
+
+
+          # ================================================
+          # RANKING
+          # ================================================
+
+          ranking = data[
+              "ranking"
+          ]
+
+
+          if not ranking:
+
+              raise SystemExit(
+                  "ERRO: ranking está vazio."
+              )
+
+
+          required_ranking_fields = [
+
+              "ticker",
+              "fundamental_score_final",
+              "technical_score",
+              "institutional_score",
+              "decisao_operacional",
+              "ranking_institucional",
+
+          ]
+
+
+          for field in required_ranking_fields:
+
+              if field not in ranking[0]:
+
+                  raise SystemExit(
+                      "ERRO: ranking sem campo "
+                      f"{field}."
+                  )
+
+
+          # ================================================
+          # PORTFÓLIO
+          # ================================================
+
+          portfolio = data[
+              "portfolio"
+          ]
+
+
+          if not portfolio:
+
+              raise SystemExit(
+                  "ERRO: portfolio está vazio."
+              )
+
+
+          required_portfolio_fields = [
+
+              "ticker",
+              "fundamental_score_final",
+              "technical_score",
+              "institutional_score",
+              "decisao_operacional",
+              "peso_estrategico",
+              "fracao_execucao",
+              "peso_executavel",
+              "peso_reservado",
+              "status_final",
+
+          ]
+
+
+          for field in required_portfolio_fields:
+
+              if field not in portfolio[0]:
+
+                  raise SystemExit(
+                      "ERRO: portfolio sem campo "
+                      f"{field}."
+                  )
+
+
+          # ================================================
+          # CONSISTÊNCIA DE CONTAGENS
+          # ================================================
+
+          summary = data[
+              "summary"
+          ]
+
+
+          if (
+              summary.get(
+                  "ranking_count"
+              )
+              !=
+              len(ranking)
+          ):
+
+              raise SystemExit(
+                  "ERRO: ranking_count divergente."
+              )
+
+
+          if (
+              summary.get(
+                  "portfolio_count"
+              )
+              !=
+              len(portfolio)
+          ):
+
+              raise SystemExit(
+                  "ERRO: portfolio_count divergente."
+              )
+
+
+          # ================================================
+          # PESOS
+          # ================================================
+
+          strategic_weight = sum(
+
+              float(
+                  item[
+                      "peso_estrategico"
+                  ]
+              )
+
+              for item
+              in portfolio
+
+          )
+
+
+          executable_weight = sum(
+
+              float(
+                  item[
+                      "peso_executavel"
+                  ]
+              )
+
+              for item
+              in portfolio
+
+          )
+
+
+          reserved_weight = sum(
+
+              float(
+                  item[
+                      "peso_reservado"
+                  ]
+              )
+
+              for item
+              in portfolio
+
+          )
+
+
+          if not math.isclose(
+              strategic_weight,
+              1.0,
+              rel_tol=1e-6,
+              abs_tol=1e-6
+          ):
+
+              raise SystemExit(
+                  "ERRO: peso estratégico não soma 1. "
+                  f"Valor={strategic_weight}"
+              )
+
+
+          if not math.isclose(
+              executable_weight
+              +
+              reserved_weight,
+              strategic_weight,
+              rel_tol=1e-6,
+              abs_tol=1e-6
+          ):
+
+              raise SystemExit(
+                  "ERRO: executável + reservado "
+                  "não corresponde ao peso estratégico."
+              )
+
+
+          # ================================================
+          # POLÍTICA DE EXPORTAÇÃO
+          # ================================================
+
+          export_policy = (
+
+              data
+              .get(
+                  "metadata",
+                  {}
+              )
+              .get(
+                  "export_policy",
+                  {}
+              )
+
+          )
+
+
+          prohibited_true_flags = [
+
+              "recalculates_scores",
+              "recalculates_ranking",
+              "reorders_ranking",
+              "recalculates_portfolio",
+              "changes_portfolio_members",
+              "recalculates_weights",
+              "changes_operational_decisions",
+              "changes_execution_fraction",
+              "changes_executable_weight",
+              "changes_reserved_weight",
+              "creates_new_investment_signal",
+              "executes_broker_orders",
+
+          ]
+
+
+          for flag in prohibited_true_flags:
+
+              if export_policy.get(
+                  flag
+              ) is not False:
+
+                  raise SystemExit(
+                      "ERRO: política de exportação "
+                      f"inválida em {flag}."
+                  )
+
+
+          # ================================================
+          # RESULTADO
+          # ================================================
+
+          print(
+              "FII Investment CIO output validado."
+          )
+
+          print(
+              "Source system:",
+              data[
+                  "source_system"
+              ]
+          )
+
+          print(
+              "Export version:",
+              data[
+                  "export_version"
+              ]
+          )
+
+          print(
+              "FIIs ranking:",
+              len(
+                  ranking
+              )
+          )
+
+          print(
+              "FIIs portfolio:",
+              len(
+                  portfolio
+              )
+          )
+
+          print(
+              "Peso estratégico:",
+              round(
+                  strategic_weight,
+                  8
+              )
+          )
+
+          print(
+              "Peso executável:",
+              round(
+                  executable_weight,
+                  8
+              )
+          )
+
+          print(
+              "Peso reservado:",
+              round(
+                  reserved_weight,
+                  8
+              )
+          )
+
+          PY
+
+
+      # ======================================================
+      # 8. UPLOAD DO RANKING
       # ======================================================
 
       - name: Upload ranking
@@ -125,7 +577,7 @@ jobs:
 
 
       # ======================================================
-      # 8. UPLOAD DO PORTFÓLIO
+      # 9. UPLOAD DO PORTFÓLIO
       # ======================================================
 
       - name: Upload portfolio
@@ -146,7 +598,7 @@ jobs:
 
 
       # ======================================================
-      # 9. UPLOAD DO UNIVERSO
+      # 10. UPLOAD DO UNIVERSO
       # ======================================================
 
       - name: Upload universe
@@ -167,7 +619,7 @@ jobs:
 
 
       # ======================================================
-      # 10. UPLOAD DO RELATÓRIO
+      # 11. UPLOAD DO RELATÓRIO
       # ======================================================
 
       - name: Upload PDF report
@@ -183,5 +635,24 @@ jobs:
           path: reports/fii_report.pdf
 
           if-no-files-found: warn
+
+          retention-days: 30
+
+
+      # ======================================================
+      # 12. UPLOAD PARA INVESTMENT CIO AGENT
+      # ======================================================
+
+      - name: Upload Investment CIO output
+
+        uses: actions/upload-artifact@v4
+
+        with:
+
+          name: fii-scanner-agent-output
+
+          path: outputs/agent_output_raw.json
+
+          if-no-files-found: error
 
           retention-days: 30
