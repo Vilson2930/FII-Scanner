@@ -11,6 +11,7 @@
 # 4. Score institucional
 # 5. Construção e otimização do portfólio
 # 6. Geração dos relatórios
+# 7. Exportação para Investment CIO Agent
 #
 # ============================================================
 
@@ -21,6 +22,8 @@ from engine.fundamental_engine import run_fundamental_engine
 from engine.technical_engine import run_technical_engine
 from engine.portfolio_engine import build_portfolio
 from engine.report_engine import generate_report
+
+from agent_export import export_agent_output
 
 
 def main():
@@ -134,7 +137,7 @@ def main():
 
 
     # --------------------------------------------------------
-    # O portfolio_engine retornará:
+    # O portfolio_engine retorna:
     #
     # ranking
     # portfolio
@@ -189,6 +192,49 @@ def main():
         portfolio=portfolio,
 
         diagnostics=diagnostics
+
+    )
+
+
+    # ========================================================
+    # ETAPA 6 — EXPORTAÇÃO PARA INVESTMENT CIO
+    # ========================================================
+    #
+    # IMPORTANTE:
+    #
+    # Esta etapa ocorre APÓS os motores quantitativos.
+    #
+    # O exportador:
+    #
+    # - não recalcula scores;
+    # - não altera ranking;
+    # - não altera carteira;
+    # - não altera pesos;
+    # - não altera decisões operacionais;
+    # - não executa ordens.
+    #
+    # Apenas serializa os resultados produzidos pelo scanner.
+    #
+    # ========================================================
+
+    print()
+    print("=" * 90)
+    print("ETAPA 6 — EXPORTAÇÃO PARA INVESTMENT CIO AGENT")
+    print("=" * 90)
+
+    export_agent_output(
+
+        database=database,
+
+        fundamentals=fundamentals,
+
+        technical=technical,
+
+        ranking=ranking,
+
+        portfolio=portfolio,
+
+        diagnostics=diagnostics,
 
     )
 
@@ -285,6 +331,10 @@ def main():
 
     print(
         "  reports/fii_report.pdf"
+    )
+
+    print(
+        "  outputs/agent_output_raw.json"
     )
 
     print()
