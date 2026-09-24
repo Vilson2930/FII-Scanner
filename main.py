@@ -11,7 +11,8 @@
 # 4. Score institucional
 # 5. Construção e otimização do portfólio
 # 6. Geração dos relatórios
-# 7. Exportação para Investment CIO Agent
+# 7. Envio do relatório por e-mail
+# 8. Exportação para Investment CIO Agent
 #
 # ============================================================
 
@@ -22,6 +23,9 @@ from engine.fundamental_engine import run_fundamental_engine
 from engine.technical_engine import run_technical_engine
 from engine.portfolio_engine import build_portfolio
 from engine.report_engine import generate_report
+
+from config import REPORT_FILE
+from email_sender import send_report_email
 
 from agent_export import export_agent_output
 
@@ -197,7 +201,23 @@ def main():
 
 
     # ========================================================
-    # ETAPA 6 — EXPORTAÇÃO PARA INVESTMENT CIO
+    # ETAPA 6 — ENVIO DO RELATÓRIO POR E-MAIL
+    # ========================================================
+
+    print()
+    print("=" * 90)
+    print("ETAPA 6 — ENVIO DO RELATÓRIO POR E-MAIL")
+    print("=" * 90)
+
+    send_report_email(
+        pdf_path=REPORT_FILE,
+        portfolio=portfolio,
+        diagnostics=diagnostics,
+    )
+
+
+    # ========================================================
+    # ETAPA 7 — EXPORTAÇÃO PARA INVESTMENT CIO
     # ========================================================
     #
     # IMPORTANTE:
@@ -219,7 +239,7 @@ def main():
 
     print()
     print("=" * 90)
-    print("ETAPA 6 — EXPORTAÇÃO PARA INVESTMENT CIO AGENT")
+    print("ETAPA 7 — EXPORTAÇÃO PARA INVESTMENT CIO AGENT")
     print("=" * 90)
 
     export_agent_output(
