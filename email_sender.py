@@ -1,4 +1,5 @@
 import os
+import ssl
 import smtplib
 from pathlib import Path
 from email.message import EmailMessage
@@ -41,6 +42,10 @@ def send_report_email(
         raise RuntimeError(
             "Secret EMAIL_TO não encontrado."
         )
+
+    email_user = email_user.strip()
+    email_password = email_password.strip()
+    email_to = email_to.strip()
 
     # ==========================================================
     # VALIDAÇÃO DO PDF
@@ -85,6 +90,7 @@ def send_report_email(
             )
 
             for decisao, quantidade in decisoes.items():
+
                 resumo.append(
                     f"{decisao}: {quantidade}"
                 )
@@ -107,6 +113,7 @@ def send_report_email(
             )
 
     if not resumo:
+
         resumo.append(
             "Relatório institucional concluído com sucesso."
         )
@@ -152,8 +159,9 @@ de portfólio do sistema.
     # ANEXAR PDF
     # ==========================================================
 
-    with open(pdf_path, "rb") as f:
-        pdf_data = f.read()
+    with open(pdf_path, "rb") as file:
+
+        pdf_data = file.read()
 
     msg.add_attachment(
         pdf_data,
@@ -171,12 +179,77 @@ de portfólio do sistema.
     print("ENVIO DO RELATÓRIO POR E-MAIL")
     print("=" * 100)
 
+    context = ssl.create_default_context()
+
+    erro_starttls = None
+
+    # ==========================================================
+    # TENTATIVA 1 — STARTTLS / PORTA 587
+    # ==========================================================
+
     try:
+
+        print(
+            "Tentativa SMTP 1: Gmail STARTTLS / porta 587"
+        )
+
+        with smtplib.SMTP(
+            "smtp.gmail.com",
+            587,
+            timeout=60,
+        ) as smtp:
+
+            smtp.ehlo()
+
+            smtp.starttls(
+                context=context
+            )
+
+            smtp.ehlo()
+
+            smtp.login(
+                email_user,
+                email_password,
+            )
+
+            smtp.send_message(msg)
+
+        print(
+            f"Relatório enviado com sucesso para: {email_to}"
+        )
+
+        print("=" * 100)
+
+        return
+
+    except Exception as exc:
+
+        erro_starttls = exc
+
+        print(
+            "Tentativa STARTTLS/587 falhou: "
+            f"{type(exc).__name__}: {exc}"
+        )
+
+        print(
+            "Tentando conexão alternativa SSL/465..."
+        )
+
+    # ==========================================================
+    # TENTATIVA 2 — SSL / PORTA 465
+    # ==========================================================
+
+    try:
+
+        print(
+            "Tentativa SMTP 2: Gmail SSL / porta 465"
+        )
 
         with smtplib.SMTP_SSL(
             "smtp.gmail.com",
             465,
-            timeout=30,
+            timeout=60,
+            context=context,
         ) as smtp:
 
             smtp.login(
@@ -186,14 +259,22 @@ de portfólio do sistema.
 
             smtp.send_message(msg)
 
+        print(
+            f"Relatório enviado com sucesso para: {email_to}"
+        )
+
+        print("=" * 100)
+
+        return
+
     except Exception as exc:
 
         raise RuntimeError(
-            f"Falha ao enviar relatório por e-mail: {exc}"
+            "\nFalha nas duas tentativas de envio do Gmail.\n"
+            f"STARTTLS/587: "
+            f"{type(erro_starttls).__name__}: "
+            f"{erro_starttls}\n"
+            f"SSL/465: "
+            f"{type(exc).__name__}: "
+            f"{exc}"
         ) from exc
-
-    print(
-        f"Relatório enviado com sucesso para: {email_to}"
-    )
-
-    print("=" * 100)
